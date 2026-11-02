@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "public-repo-guard"
+version = "0.1.0"
+description = "Stop private names reaching a public GitHub repository: a pre-push hook and an AI coding agent hook that read what a push would publish, only when the repository is public."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "public-repo-guard contributors" }]
+keywords = ["git", "github", "pre-push", "claude-code", "ai-agents", "guardrails", "privacy", "hooks"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+public-repo-guard = "public_repo_guard.cli:main"
+
+[project.urls]
+Source = "https://github.com/RobBrautigam/public-repo-guard"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --color=no"

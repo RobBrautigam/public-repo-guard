@@ -1,0 +1,45 @@
+# An example denylist. Every name here is invented.
+#
+# Copy it OUTSIDE every public repository and make it yours:
+#   ~/.config/public-repo-guard/denylist.toml   (the default)
+#   or set PUBLIC_REPO_GUARD_DENYLIST to any path
+#
+# A refusal names the pattern id and the matched words, never the regex, so the list itself
+# never reaches an agent's transcript or a terminal log in full.
+# Patterns are case-insensitive unless `case_sensitive = true`.
+# Use single-quoted TOML strings for regexes: backslashes stay literal.
+
+[[pattern]]
+id = "client-northwind"
+category = "client"
+# allows any run of spaces, dashes, dots or underscores between the words
+regex = 'northwind[\s_.-]*traders'
+
+[[pattern]]
+id = "client-northwind-short"
+category = "client"
+regex = '\bNWT\b'
+case_sensitive = true
+
+[[pattern]]
+id = "company-bluebird"
+category = "company"
+regex = 'bluebird[\s_.-]*labs'
+# the company may appear in the license line, nowhere else
+allow_paths = ["LICENSE"]
+
+[[pattern]]
+id = "person-jane"
+category = "person"
+regex = 'jane[\s_.-]*example'
+
+[[pattern]]
+id = "internal-host"
+category = "infrastructure"
+regex = '[a-z0-9-]+\.corp\.example\.net'
+
+[[pattern]]
+id = "home-path"
+category = "machine"
+# a home folder on the machine that wrote the code
+regex = '(/home/|/Users/|[A-Za-z]:[\\/]Users[\\/])janedev'
