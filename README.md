@@ -11,16 +11,18 @@ push on their own.
 
 - **Silent unless public.** The same push to a private repository passes with no output, so your
   denylist can name everything you work on without getting in the way of private work.
-- **Fails closed when public.** No denylist, a scan that cannot finish, or a visibility it cannot read
-  on a push: refused, with the reason.
-- **Reads what GitHub does not hold yet:** every new commit's message, every added line and every added
-  file name (from `git ls-remote`, never stale tracking refs). A line removed in a later commit is still
-  caught, because the history goes public too.
+- **Fails closed when public.** No denylist, or a scan that cannot finish, on a public push: refused,
+  with the reason. A visibility it cannot read is treated as public and scanned.
+- **Reads what GitHub does not hold yet:** every new commit's message, every added line, every added
+  file name (binary and empty files included) and the branch and tag names the push creates. What the
+  remote already holds comes from `git ls-remote`, never stale tracking refs. A line removed in a later
+  commit is still caught, because the history goes public too.
 - **Two doors, one denylist:** a git `pre-push` hook (any person, any agent, any editor) and a Claude
   Code `PreToolUse` hook that also reads what git never sees: `gh repo create --public`,
   `gh repo edit --visibility public`, and pull request and issue titles, bodies and comments.
-- **The denylist never travels.** It lives outside every repository (refused if it sits inside one),
-  and a refusal names the pattern id and the matched words, never the pattern.
+- **The denylist never travels.** It lives outside your repositories (a public push is refused if the
+  denylist sits inside the repository being pushed), and a refusal names the pattern id and the
+  matched words, never the pattern.
 - **No dependencies**, Python 3.11 or newer, no account. Network: one visibility read per repository
   every ten minutes, and on a public push, one `git ls-remote` to the remote being pushed to.
 
@@ -33,11 +35,11 @@ Take each one out (edit the file, reword the message, or amend the commit) and r
 
 ## Why it exists
 
-An AI coding session closed its work the way it had been told to: write a briefing file into the
-repository and merge it. Right for a private repository, wrong for a public one. The briefing named
-internal projects and companies, and it landed on a public main branch. A rule written in prose did
-not stop it, because the agent that wrote the briefing was following a different rule. So the check
-moved to the moment of action: the push itself.
+Picture an AI coding session told to close its work by writing a notes file into the repository and
+merging it. Right for a private repository, wrong for a public one: the notes name the clients and
+projects the session touched, and they land on a public main branch. A rule written in prose does not
+stop that, because the agent writing the notes is following a different rule. So the check belongs
+at the moment of action: the push itself.
 
 ## Quick start (two minutes, offline)
 
@@ -90,7 +92,7 @@ and the rewritten fixture goes through. Nothing leaves your machine.
        "PreToolUse": [
          {
            "matcher": "Bash|PowerShell",
-           "hooks": [{ "type": "command", "command": "public-repo-guard hook", "timeout": 60 }]
+           "hooks": [{ "type": "command", "command": "public-repo-guard hook", "timeout": 300 }]
          }
        ]
      }
@@ -98,20 +100,23 @@ and the rewritten fixture goes through. Nothing leaves your machine.
    ```
 
    The hook reads the command the agent is about to run, follows `cd`, `git -C`, `bash -c`,
-   `pwsh -Command`, `cmd /c`, `env` and `timeout`, and exits 2 with the findings when it refuses;
-   Claude Code shows the agent the reason, and the agent fixes the file instead of pushing.
+   `pwsh -Command`, `cmd /c`, `env`, `nice`, `sudo` and `timeout`, skips comments and heredoc bodies,
+   and exits 2 with the findings when it refuses; Claude Code shows the agent the reason, and the agent
+   fixes the file instead of pushing. Keep the timeout generous: Claude Code lets a command through
+   when its hook times out, and the scan gives git up to three minutes on a large push.
 
 4. **Before making an old repository public:** `public-repo-guard scan-tree .` reads every tracked
-   file, and `public-repo-guard scan-range <first-commit>..HEAD` reads its history. (The agent hook
-   runs the history scan on its own when it sees `gh repo create --public --source` or
-   `gh repo edit --visibility public`.)
+   file, and `public-repo-guard scan-range --all` reads the history of every branch and tag, first
+   commit included (`scan-range origin/main..HEAD` reads only the commits in that range). The agent
+   hook runs the full history scan on its own when it sees `gh repo create --public --source` or
+   `gh repo edit --visibility public`.
 
 ## How it decides
 
 | Step | What happens |
 |---|---|
 | Which repository | The push remote of the current branch (pushRemote, pushDefault, the branch's remote, the only remote, origin), or the remote or URL given; `-R` or the `repos/<owner>/<repo>` path for gh |
-| Public or not | A ten-minute cache, then `gh api repos/<owner>/<repo>` (sees your private repositories when you are signed in), then GitHub's public REST API with no token; a 404 there means the world cannot see it |
+| Public or not | A ten-minute cache, then `gh api repos/<owner>/<repo>` (sees your private repositories when you are signed in), then GitHub's public REST API with no token; a 404 there means the world cannot see it. A remote it cannot place (an SSH host alias, a self-hosted server) is treated as public; GitLab, Bitbucket and local paths are not GitHub and pass |
 | Not public | Pass, no output, the denylist is never read |
 | Public, or unreadable | Load the denylist (refuse if missing or inside the repository), ask the remote which commits it holds, scan the rest: messages, added lines (`git log -p -U0`, merges by `--diff-merges=remerge`), added file names, branch and tag names |
 | Findings | Refuse with up to twelve, each with the file and line or the commit, the category, the pattern id and the matched words |
@@ -125,11 +130,16 @@ Be clear-eyed about these before you rely on it:
 
 - **`git push --no-verify` skips the git hook.** The agent hook still reads that push, because it runs
   before the command and does not care about git's flags. A person who means to publish can.
-- **A name split across two lines**, spelled letter by letter, or encoded (base64, a screenshot) is not
-  found. Binary files are skipped; their file names are read.
-- **Non-GitHub remotes** (GitLab, Bitbucket, a self-hosted server) pass: their visibility is not read.
+- **A bare `git push` under `push.default=matching` or a configured `remote.<name>.push` refspec**:
+  the agent hook reads the current branch only; the git hook reads every branch git actually sends.
+- **A name split across two lines**, spelled letter by letter, or encoded (base64, UTF-16 text, a
+  screenshot) is not found. The contents of files git treats as binary are skipped; their file names
+  are read.
+- **Commit author and committer names and emails** are not scanned; set them to what you want public.
+- **Non-GitHub remotes** (GitLab, Bitbucket, a local path) pass: their visibility is not read.
 - **The agent hook reads the command line**, not scripts it calls: a `make release` or a shell script
-  that pushes is read only by the git hook. Heredoc bodies, annotated tag messages and gists are not
+  that pushes is read only by the git hook, and so is a push written inside a heredoc body fed to a
+  shell. A PowerShell `$variable` in a path is not expanded. Annotated tag messages and gists are not
   read.
 - **Issues, wiki pages and releases already on GitHub** are not read; neither is anything done in
   GitHub's web page.
@@ -142,7 +152,7 @@ Be clear-eyed about these before you rely on it:
 | `public-repo-guard pre-push REMOTE [URL]` | git pre-push hook; stdin is git's ref lines; exit 1 refuses |
 | `public-repo-guard install [DIR] [--force]` | write the pre-push hook into a repository |
 | `public-repo-guard scan-tree [DIR]` | every tracked file (or every file of a plain folder) |
-| `public-repo-guard scan-range RANGE [--repo DIR]` | the commits of a range, e.g. `origin/main..HEAD` |
+| `public-repo-guard scan-range (RANGE \| --all) [--repo DIR]` | the commits of a range, e.g. `origin/main..HEAD`, or every branch and tag with `--all` |
 | `public-repo-guard check-denylist` | load the denylist; print its count and categories, never its patterns |
 | `public-repo-guard visibility OWNER/REPO` | print public, private, internal, unknown or not-github |
 

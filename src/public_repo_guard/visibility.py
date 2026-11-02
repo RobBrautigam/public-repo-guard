@@ -27,11 +27,18 @@ ENV_CACHE = "PUBLIC_REPO_GUARD_CACHE"
 TTL_SECONDS = 600
 
 _SLUG = re.compile(
-    r"^(?:https?://(?:[^@/]+@)?github\.com/|git@github\.com:|ssh://git@github\.com(?::\d+)?/)"
+    r"^(?:https?://(?:[^@/]+@)?(?:www\.)?github\.com(?::\d+)?/"
+    r"|ssh://(?:[^@/]+@)?(?:ssh\.)?github\.com(?::\d+)?/"
+    r"|(?:[^@/:]+@)?(?:ssh\.)?github\.com:)"
     r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?/?$",
     re.IGNORECASE,
 )
 _PLAIN_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_SCP = re.compile(r"^(?:[^@/:]+@)?(?P<host>[^@/:]+):(?!//)")
+_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
+# hosts that are known not to be GitHub; any other host (an SSH alias, a self-hosted server) is unknown
+OTHER_HOSTS = ("gitlab.com", "bitbucket.org", "codeberg.org", "dev.azure.com", "ssh.dev.azure.com",
+               "vs-ssh.visualstudio.com", "git.sr.ht", "gitea.com", "huggingface.co")
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -42,6 +49,26 @@ def github_slug(url: str | None) -> str | None:
         return None
     match = _SLUG.match(url.strip())
     return f"{match['owner']}/{match['repo']}" if match else None
+
+
+def host_kind(url: str) -> str:
+    """"github", "other" (a local path or a known non-GitHub host) or "unknown" (an SSH alias, a
+    self-hosted server: it may be GitHub under another name, so the caller treats it as public)."""
+    text = url.strip()
+    if github_slug(text):
+        return "github"
+    if "://" in text:
+        scheme, rest = text.split("://", 1)
+        if scheme.lower() == "file":
+            return "other"
+        host = rest.split("/", 1)[0].rsplit("@", 1)[-1].split(":", 1)[0].lower()
+    elif _DRIVE.match(text) or not _SCP.match(text):
+        return "other"  # a local path
+    else:
+        host = _SCP.match(text)["host"].lower()
+    if any(host == h or host.endswith("." + h) for h in OTHER_HOSTS):
+        return "other"
+    return "unknown"
 
 
 def repo_arg_slug(value: str | None) -> str | None:
@@ -101,7 +128,9 @@ def _from_gh(slug: str) -> str | None:
     return None
 
 
-def _from_rest(slug: str) -> str:
+def _from_rest(slug: str) -> tuple[str, bool]:
+    """(answer, worth caching). A 404 is private for now but never cached: the repository may be
+    about to be created or made public."""
     request = urllib.request.Request(
         f"https://api.github.com/repos/{slug}",
         headers={"User-Agent": "public-repo-guard", "Accept": "application/vnd.github+json"},
@@ -110,13 +139,13 @@ def _from_rest(slug: str) -> str:
         with urllib.request.urlopen(request, timeout=10) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        return PRIVATE if exc.code == 404 else UNKNOWN
+        return (PRIVATE, False) if exc.code == 404 else (UNKNOWN, False)
     except (urllib.error.URLError, OSError, ValueError):
-        return UNKNOWN
+        return UNKNOWN, False
     answer = str(data.get("visibility") or "").lower()
     if answer in (PUBLIC, PRIVATE, INTERNAL):
-        return answer
-    return PRIVATE if data.get("private") else PUBLIC
+        return answer, True
+    return (PRIVATE if data.get("private") else PUBLIC), True
 
 
 def visibility(slug: str | None) -> str:
@@ -129,7 +158,10 @@ def visibility(slug: str | None) -> str:
     entry = _read_cache().get(slug.lower())
     if isinstance(entry, list) and len(entry) == 2 and time.time() - float(entry[1]) < TTL_SECONDS:
         return str(entry[0])
-    answer = _from_gh(slug) or _from_rest(slug)
-    if answer != UNKNOWN:
+    answer = _from_gh(slug)
+    keep = answer is not None
+    if answer is None:
+        answer, keep = _from_rest(slug)
+    if keep:
         remember(slug, answer)
     return answer

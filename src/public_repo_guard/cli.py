@@ -4,7 +4,7 @@
     public-repo-guard pre-push REMOTE URL   git pre-push hook (stdin: git's ref lines; exit 1 refuses)
     public-repo-guard install [DIR]         write the pre-push hook into a repository
     public-repo-guard scan-tree [DIR]       every tracked file of a folder, before you make it public
-    public-repo-guard scan-range RANGE      the commits of a range, e.g. origin/main..HEAD
+    public-repo-guard scan-range RANGE      the commits of a range (origin/main..HEAD), or --all
     public-repo-guard check-denylist        load the denylist and say how many patterns it holds
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 from . import __version__
 from . import denylist as dl
 from . import gitscan
-from .command import Unreadable, parse
+from .command import Unreadable, mentions_publishing, parse
 from .guard import Verdict, check_action, check_push
 from .visibility import github_slug, visibility
 
@@ -42,14 +42,21 @@ def cmd_hook(_args: argparse.Namespace) -> int:
         return 0
     cwd = event.get("cwd") or os.getcwd()
     try:
-        actions = parse(command, cwd)
-    except Unreadable:
-        return 0  # the shell cannot run it either
+        actions = parse(command, cwd, powershell=event.get("tool_name") == "PowerShell")
+    except Unreadable as exc:
+        if not mentions_publishing(command):
+            return 0
+        print(f"public-repo-guard: refused. this command looks like it publishes and could not be read ({exc}); "
+              f"run the push or the gh command on its own line", file=sys.stderr)
+        return 2
     for action in actions:
         try:
             verdict = check_action(action, _load)
         except gitscan.GitError as exc:
             print(f"public-repo-guard: refused. git could not be read for this command: {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:  # noqa: BLE001 - any other failure on a publishing command refuses it
+            print(f"public-repo-guard: refused. the check failed ({type(exc).__name__}: {exc})", file=sys.stderr)
             return 2
         if verdict.refused:
             print(verdict.render(), file=sys.stderr)
@@ -65,12 +72,13 @@ def cmd_pre_push(args: argparse.Namespace) -> int:
     tips, names = [], []
     for line in sys.stdin.read().splitlines():
         parts = line.split()
-        if len(parts) == 4 and parts[1] != gitscan.ZERO_SHA:
+        if len(parts) == 4 and not gitscan.is_zero(parts[1]):
             tips.append(parts[1])
             names.append(parts[2].removeprefix("refs/heads/").removeprefix("refs/tags/"))
     if not tips:
         return 0
-    verdict = check_push(top, args.remote, names, _load, visibility, local_tips=tips)
+    verdict = check_push(top, args.remote, names, _load, visibility, local_tips=tips,
+                         extra_urls=[args.url] if args.url else None)
     if verdict.refused:
         print(verdict.render(), file=sys.stderr)
         return 1
@@ -116,6 +124,18 @@ def cmd_scan_range(args: argparse.Namespace) -> int:
     if top is None:
         print(f"{args.repo} is not inside a git repository", file=sys.stderr)
         return 1
+    if args.all:
+        patterns = _load()
+        findings = gitscan.scan_commits(top, ["--branches", "--tags"], [], patterns)
+        for name in gitscan.git(top, "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/tags").split():
+            findings += dl.scan_name(name, patterns, f"branch or tag name {name!r}")
+        return _report(findings, "every branch and tag, from the first commit")
+    if not args.range:
+        print("give a range (origin/main..HEAD), one revision (HEAD: its whole history), or --all", file=sys.stderr)
+        return 1
+    if "..." in args.range:
+        print("use A..B (the commits in B and not in A); A...B is not supported", file=sys.stderr)
+        return 1
     tips = [part for part in args.range.split("..") if part]
     if ".." in args.range and len(tips) == 2:
         findings = gitscan.scan_commits(top, [tips[1]], [tips[0]], _load())
@@ -155,7 +175,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("dir", nargs="?", default=".")
     p.set_defaults(fn=cmd_scan_tree)
     p = sub.add_parser("scan-range")
-    p.add_argument("range")
+    p.add_argument("range", nargs="?")
+    p.add_argument("--all", action="store_true", help="every branch and tag, from the first commit")
     p.add_argument("--repo", default=".")
     p.set_defaults(fn=cmd_scan_range)
     sub.add_parser("check-denylist").set_defaults(fn=cmd_check_denylist)
@@ -165,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.fn(args)
-    except dl.DenylistError as exc:
+    except (dl.DenylistError, gitscan.GitError) as exc:
         print(f"public-repo-guard: {exc}", file=sys.stderr)
         return 1 if args.command != "hook" else 2
 

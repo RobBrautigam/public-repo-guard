@@ -10,7 +10,8 @@ from typing import Callable
 from . import denylist as dl
 from . import gitscan
 from .command import Action
-from .visibility import INTERNAL, NOT_GITHUB, PRIVATE, PUBLIC, github_slug, remember, repo_arg_slug, visibility
+from .visibility import (INTERNAL, NOT_GITHUB, PRIVATE, PUBLIC, UNKNOWN, github_slug, host_kind, remember,
+                         repo_arg_slug, visibility)
 
 MAX_SHOWN = 12
 FIX = (
@@ -68,17 +69,29 @@ def _patterns(load: Loader, target: str, top: Path | None) -> tuple[list[dl.Patt
     return patterns, None
 
 
-def check_push(top: Path, remote: str | None, refs: list[str], load: Loader,
-               resolve: Resolver = visibility, local_tips: list[str] | None = None) -> Verdict:
-    remote = remote or gitscan.push_remote(top)
-    url = gitscan.remote_url(top, remote)
-    if url is None:
-        return Verdict()  # git will refuse an unknown remote on its own
+def _answer(url: str, resolve: Resolver) -> tuple[str, str]:
+    """(target, visibility) for one push URL. A host this tool cannot place (an SSH alias, a
+    self-hosted server) is unknown, and unknown is treated as public."""
     slug = github_slug(url)
-    answer = resolve(slug)
-    target = slug or url
-    if not _is_public(answer):
+    if slug:
+        return slug, resolve(slug)
+    forced = resolve(None)  # not-github, unless the environment forces an answer
+    if forced != NOT_GITHUB:
+        return url, forced
+    return url, (UNKNOWN if host_kind(url) == "unknown" else NOT_GITHUB)
+
+
+def check_push(top: Path, remote: str | None, refs: list[str], load: Loader,
+               resolve: Resolver = visibility, local_tips: list[str] | None = None,
+               extra_urls: list[str] | None = None) -> Verdict:
+    remote = remote or gitscan.push_remote(top)
+    urls = list(dict.fromkeys([*(u for u in (extra_urls or []) if u), *gitscan.push_urls(top, remote)]))
+    if not urls:
+        return Verdict()  # git will refuse an unknown remote on its own
+    public = [(target, answer) for target, answer in (_answer(u, resolve) for u in urls) if _is_public(answer)]
+    if not public:
         return Verdict()
+    target, answer = public[0]
     patterns, refusal = _patterns(load, target, top)
     if refusal:
         return refusal
@@ -86,7 +99,8 @@ def check_push(top: Path, remote: str | None, refs: list[str], load: Loader,
         exclude = gitscan.present_locally(top, gitscan.remote_shas(top, remote))
         tips = local_tips if local_tips is not None else _tips(top, refs)
         findings = gitscan.scan_commits(top, tips, exclude, patterns)
-        findings += _scan_ref_names(tips, refs, patterns)
+        names = list(refs) if local_tips is not None else _pushed_names(top, refs)
+        findings += _scan_ref_names(names, patterns)
     except gitscan.GitError as exc:
         return Verdict(True, target, f"{target} reads as {answer} and the scan could not finish: {exc}")
     if findings:
@@ -94,9 +108,32 @@ def check_push(top: Path, remote: str | None, refs: list[str], load: Loader,
     return Verdict()
 
 
+def _pushed_names(top: Path, refs: list[str]) -> list[str]:
+    """The branch and tag names a typed push can create on the remote: the refspecs, plus the
+    current branch (and its upstream name) for a bare push or HEAD, plus every local branch for
+    `:`, --all, --branches or --mirror, and every tag for --tags or --mirror."""
+    names = [r for r in refs if not r.startswith("-")]
+    sources = [r.lstrip("+").split(":", 1)[0] for r in names]
+    if not names or "HEAD" in sources:
+        branch = gitscan.current_branch(top)
+        if branch:
+            names.append(branch)
+            merge = gitscan.config(top, f"branch.{branch}.merge")
+            if merge:
+                names.append(merge.removeprefix("refs/heads/"))
+    kinds = []
+    if ":" in names or any(r in ("--all", "--branches", "--mirror") for r in refs):
+        kinds.append("refs/heads")
+    if any(r in ("--tags", "--mirror") for r in refs):
+        kinds.append("refs/tags")
+    if kinds:
+        names += gitscan.git(top, "for-each-ref", "--format=%(refname:short)", *kinds).split()
+    return names
+
+
 def _tips(top: Path, refs: list[str]) -> list[str]:
     """The local commits a push names; everything local when the refspec cannot be read."""
-    if any(r in ("--all", "--mirror", "--branches") for r in refs):
+    if any(r in ("--all", "--mirror", "--branches", ":", "+:") for r in refs):
         tips = ["--branches"]
         return tips + (["--tags"] if "--mirror" in refs else [])
     sources: list[str] = []
@@ -122,13 +159,13 @@ def _tips(top: Path, refs: list[str]) -> list[str]:
     return resolved
 
 
-def _scan_ref_names(tips: list[str], refs: list[str], patterns: list[dl.Pattern]) -> list[dl.Finding]:
+def _scan_ref_names(names: list[str], patterns: list[dl.Pattern]) -> list[dl.Finding]:
     found: list[dl.Finding] = []
-    for ref in refs:
+    for ref in dict.fromkeys(names):
         if ref.startswith("-"):
             continue
-        for part in ref.lstrip("+").split(":"):
-            if part:
+        for part in dict.fromkeys(ref.lstrip("+").split(":")):
+            if part and part != "HEAD":
                 found += dl.scan_name(part, patterns, f"branch or tag name {part!r}")
     return found
 
@@ -156,21 +193,31 @@ def check_make_public(source: Path | None, words: list[str], load: Loader, slug:
                                      "folder holds it; run the command from that folder")
     if findings:
         return Verdict(True, target, f"making {target} public would publish private names:", findings)
+    if not slug and top is not None:
+        slug = github_slug(gitscan.remote_url(top, gitscan.push_remote(top)))
     if slug:
-        remember(slug, PUBLIC)
+        remember(slug, PUBLIC)  # so the next push reads it as public, not a cached "private"
     return Verdict()
 
 
 def check_gh_text(cwd: Path, repo: str | None, words: list[str], files: list[str], load: Loader,
                   resolve: Resolver = visibility) -> Verdict:
-    slug = repo_arg_slug(repo)
+    slug = repo_arg_slug(repo) or repo_arg_slug(os.environ.get("GH_REPO"))
     if slug is None:
         top = gitscan.toplevel(cwd)
         if top is None:
-            return Verdict()  # gh itself will ask which repository
-        url = gitscan.remote_url(top, gitscan.push_remote(top))
+            return Verdict(True, "the repository", f"cannot tell which repository this gh command writes to "
+                                                   f"from {cwd}; name it with -R OWNER/NAME")
+        # gh's own choice first: `gh repo set-default`, then the push remote
+        remote = gitscan.gh_default_remote(top) or gitscan.push_remote(top)
+        url = gitscan.remote_url(top, remote)
+        if url is None:
+            return Verdict(True, "the repository", f"cannot read the remote {remote!r}; name the repository "
+                                                   f"with -R OWNER/NAME")
+        slug, answer = _answer(url, resolve)
         slug = github_slug(url)
-    answer = resolve(slug)
+    else:
+        answer = resolve(slug)
     target = slug or "the repository"
     if not _is_public(answer):
         return Verdict()
@@ -194,7 +241,9 @@ def check_action(action: Action, load: Loader, resolve: Resolver = visibility) -
     if action.kind == "push":
         top = gitscan.toplevel(cwd)
         if top is None:
-            return Verdict()
+            # fail closed: a folder this tool cannot find is a push it cannot read
+            return Verdict(True, str(cwd), f"cannot find the repository this push runs in ({cwd}); "
+                                           f"run it from inside the repository, or with git -C <folder>")
         return check_push(top, action.remote, action.refs, load, resolve)
     if action.kind == "make_public":
         slug = repo_arg_slug(action.repo)
@@ -210,6 +259,8 @@ def check_action(action: Action, load: Loader, resolve: Resolver = visibility) -
             findings = dl.scan_text(" ".join(action.words), patterns, "the gh command's words")
             if findings:
                 return Verdict(True, target, f"creating {target} would publish private names:", findings)
+            if slug:
+                remember(slug, PUBLIC)
             return Verdict()
         source: Path | None = cwd if not action.repo else None
         if source is None and slug:

@@ -134,3 +134,97 @@ def test_a_push_that_deletes_publishes_nothing():
 def test_an_unclosed_quote_is_unreadable():
     with pytest.raises(Unreadable):
         parse('git commit -m "half', "/work")
+
+
+# ------------------------------------------------------------- shapes the close review found
+
+
+def test_comments_and_heredoc_bodies_do_not_hide_a_push():
+    assert kinds("git push origin main # don't")[0][0] == "push"
+    heredoc = "git commit --allow-empty -F - <<'EOF'\nit's done\nEOF\ngit push origin main"
+    assert kinds(heredoc)[0][:3] == ("push", "", "origin")
+    herestring = "git commit -m @'\nit's done\n'@\ngit push origin main"
+    assert [a.kind for a in parse(herestring, "/work", powershell=True)] == ["push"]
+    assert kinds("git commit -m 'issue#3 fixed' && git push")[0][0] == "push"
+
+
+def test_powershell_paths_keep_their_backslashes():
+    action = parse(r"git -C D:\src\repo push origin main", "/work", powershell=True)[0]
+    assert Path(action.cwd) == Path(r"D:\src\repo")
+    action = parse(r"cd D:\src\repo; git push", "/work", powershell=True)[0]
+    assert Path(action.cwd) == Path(r"D:\src\repo")
+
+
+def test_wrapper_options_that_take_a_value_are_skipped():
+    for command in ("nice -n 10 git push origin main", "timeout -k 5 60 git push origin main",
+                    "timeout --signal KILL 60 git push origin main", "env -u HOME git push origin main",
+                    "sudo -u bob git push origin main"):
+        assert kinds(command)[0][:3] == ("push", "", "origin"), command
+    assert Path(parse("env -C sub git push", "/work")[0].cwd) == Path("/work/sub")
+    assert Path(parse("env -C sub true; git push", "/work")[0].cwd) == Path("/work")
+
+
+def test_every_gh_form_that_publishes_is_read(tmp_path):
+    assert kinds("gh repo create octo/x --public=true --source . --push")[0][:2] == ("make_public", "create")
+    body = tmp_path / "body.json"
+    body.write_text('{"private": false}', encoding="utf-8")
+    assert kinds(f"gh api -X PATCH repos/octo/x --input {body.as_posix()}")[0][:2] == ("make_public", "api")
+    notes = tmp_path / "notes.md"
+    notes.write_text("a body\n", encoding="utf-8")
+    action = parse(f"gh api repos/octo/x/issues -F title=x -F body=@{notes.as_posix()}", "/work")[0]
+    assert action.kind == "gh_text" and Path(action.files[0]) == notes
+
+
+@pytest.mark.parametrize("url, kind", [
+    ("https://www.github.com/octo/tool", "github"),
+    ("ssh://git@ssh.github.com:443/octo/tool.git", "github"),
+    ("org-123@github.com:octo/tool.git", "github"),
+    ("git@github-work:octo/tool.git", "unknown"),
+    ("gh:octo/tool", "unknown"),
+    ("https://git.example.net/octo/tool.git", "unknown"),
+    ("git@gitlab.com:octo/tool.git", "other"),
+    ("../remote.git", "other"),
+    ("C:/repos/remote.git", "other"),
+    ("file:///srv/remote.git", "other"),
+])
+def test_host_kind(url, kind):
+    from public_repo_guard.visibility import host_kind
+    assert host_kind(url) == kind
+
+
+def test_allow_paths_must_be_text(tmp_path):
+    path = tmp_path / "d.toml"
+    path.write_text("[[pattern]]\nid = 'x'\nregex = 'zzz'\nallow_paths = [1]\n", encoding="utf-8")
+    with pytest.raises(dl.DenylistError, match="allow_paths"):
+        dl.load(path)
+
+
+def test_a_zero_id_of_either_length_is_a_delete():
+    from public_repo_guard.gitscan import is_zero
+    assert is_zero("0" * 40) and is_zero("0" * 64) and not is_zero("0" * 39 + "1") and not is_zero("")
+
+
+def test_any_failure_in_the_check_refuses_the_command(monkeypatch, capsys):
+    import io
+    import json
+    from public_repo_guard import cli
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cli, "check_action", broken)
+    event = {"tool_name": "Bash", "tool_input": {"command": "git push origin main"}, "cwd": str(ROOT)}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    assert cli.cmd_hook(None) == 2
+    assert "RuntimeError: boom" in capsys.readouterr().err
+
+
+def test_text_that_cannot_be_read_is_refused_only_when_it_publishes(monkeypatch, capsys):
+    import io
+    import json
+    from public_repo_guard import cli
+
+    for command, code in (('git push origin "main', 2), ('echo "half', 0)):
+        event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(ROOT)}
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+        assert cli.cmd_hook(None) == code, command

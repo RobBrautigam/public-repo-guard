@@ -95,6 +95,8 @@ def load(path: Path | None = None) -> list[Pattern]:
         allow = raw.get("allow_paths", [])
         if isinstance(allow, str):
             allow = [allow]
+        if not isinstance(allow, list) or not all(isinstance(a, str) and a for a in allow):
+            raise DenylistError(f"pattern {pid!r}: allow_paths must be a list of path patterns (text)")
         patterns.append(Pattern(pid, str(raw.get("category", "private")), compiled, tuple(allow)))
     if not patterns:
         raise DenylistError(f"the denylist at {path} holds no [[pattern]] entries")
