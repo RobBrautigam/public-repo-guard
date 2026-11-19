@@ -10,7 +10,6 @@ from pathlib import Path
 from .denylist import Finding, Pattern, scan_lines, scan_name, scan_text
 from .visibility import NO_WINDOW
 
-ZERO_SHA = "0" * 40
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 _START = "\x1epublic-repo-guard commit "
 _END = "\x1epublic-repo-guard end"
