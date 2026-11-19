@@ -25,10 +25,6 @@ from .visibility import github_slug, visibility
 HOOK_MARK = "# installed by public-repo-guard"
 
 
-def _load() -> list[dl.Pattern]:
-    return dl.load()
-
-
 def cmd_hook(_args: argparse.Namespace) -> int:
     """Claude Code PreToolUse: exit 2 with the reason on stderr refuses the tool call."""
     try:
@@ -51,7 +47,7 @@ def cmd_hook(_args: argparse.Namespace) -> int:
         return 2
     for action in actions:
         try:
-            verdict = check_action(action, _load)
+            verdict = check_action(action, dl.load)
         except gitscan.GitError as exc:
             print(f"public-repo-guard: refused. git could not be read for this command: {exc}", file=sys.stderr)
             return 2
@@ -77,7 +73,7 @@ def cmd_pre_push(args: argparse.Namespace) -> int:
             names.append(parts[2].removeprefix("refs/heads/").removeprefix("refs/tags/"))
     if not tips:
         return 0
-    verdict = check_push(top, args.remote, names, _load, visibility, local_tips=tips,
+    verdict = check_push(top, args.remote, names, dl.load, visibility, local_tips=tips,
                          extra_urls=[args.url] if args.url else None)
     if verdict.refused:
         print(verdict.render(), file=sys.stderr)
@@ -116,7 +112,7 @@ def _report(findings: list[dl.Finding], what: str) -> int:
 
 def cmd_scan_tree(args: argparse.Namespace) -> int:
     root = Path(args.dir).resolve()
-    return _report(gitscan.scan_tree(root, _load()), str(root))
+    return _report(gitscan.scan_tree(root, dl.load()), str(root))
 
 
 def cmd_scan_range(args: argparse.Namespace) -> int:
@@ -125,7 +121,7 @@ def cmd_scan_range(args: argparse.Namespace) -> int:
         print(f"{args.repo} is not inside a git repository", file=sys.stderr)
         return 1
     if args.all:
-        patterns = _load()
+        patterns = dl.load()
         findings = gitscan.scan_commits(top, ["--branches", "--tags"], [], patterns)
         for name in gitscan.git(top, "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/tags").split():
             findings += dl.scan_name(name, patterns, f"branch or tag name {name!r}")
@@ -138,14 +134,14 @@ def cmd_scan_range(args: argparse.Namespace) -> int:
         return 1
     tips = [part for part in args.range.split("..") if part]
     if ".." in args.range and len(tips) == 2:
-        findings = gitscan.scan_commits(top, [tips[1]], [tips[0]], _load())
+        findings = gitscan.scan_commits(top, [tips[1]], [tips[0]], dl.load())
     else:
-        findings = gitscan.scan_commits(top, [args.range], [], _load())
+        findings = gitscan.scan_commits(top, [args.range], [], dl.load())
     return _report(findings, f"the commits of {args.range}")
 
 
 def cmd_check_denylist(_args: argparse.Namespace) -> int:
-    patterns = _load()
+    patterns = dl.load()
     categories = sorted({p.category for p in patterns})
     print(f"{len(patterns)} pattern(s) in {dl.default_path()} ({', '.join(categories)})")
     return 0

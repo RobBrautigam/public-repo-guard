@@ -214,7 +214,7 @@ def check_gh_text(cwd: Path, repo: str | None, words: list[str], files: list[str
         if url is None:
             return Verdict(True, "the repository", f"cannot read the remote {remote!r}; name the repository "
                                                    f"with -R OWNER/NAME")
-        slug, answer = _answer(url, resolve)
+        _, answer = _answer(url, resolve)
         slug = github_slug(url)
     else:
         answer = resolve(slug)
