@@ -27,7 +27,8 @@ push on their own.
 - **No dependencies**, Python 3.11 or newer, no account. Network: a visibility read per repository (an
   answer GitHub gives, public, private or internal, is kept ten minutes; a 404 from the public API,
   read as private, and a read that fails are asked again next time), and on a public push, one
-  `git ls-remote` to each public URL the push goes to.
+  `git ls-remote` to each public URL the push goes to (the git hook, which git runs once for each
+  URL, asks only its own run's URL when that one is public).
 
 ```
 public-repo-guard: refused. this push would publish private names to ../remote.git (public):
@@ -109,10 +110,12 @@ and the rewritten fixture goes through. Nothing leaves your machine.
    and exits 2 with the findings when it refuses; Claude Code shows the agent the reason, and the agent
    fixes the file instead of pushing. Keep the timeout generous: Claude Code lets a command through
    when its hook times out. Each git call the scan makes has its own limit, and they add up: 60
-   seconds for each `git ls-remote` (one per public URL the push goes to) and for `git cat-file`,
-   and 120 for `git log`; the visibility read before them allows 15 seconds for `gh` and 10 for
-   GitHub's REST API. On Windows a limit is not a hard stop: a git call can run past it while a
-   child process of git still holds its output open.
+   seconds for each `git ls-remote` and each `git cat-file` (one of each per public URL the push
+   goes to), and 120 for each `git log` (one per public URL holding a different set of commits; two
+   on git older than 2.36); each visibility read before them (one per GitHub repository the push goes
+   to, unless the cache holds it) allows 15 seconds for `gh` and 10 for GitHub's REST API. On Windows
+   a limit is not a hard stop: a git call can run past it while a child process of git still holds
+   its output open.
 
 4. **Before making an old repository public:** `public-repo-guard scan-tree .` reads every tracked
    file, and `public-repo-guard scan-range --all` reads the history of every branch and tag, first
@@ -127,7 +130,7 @@ and the rewritten fixture goes through. Nothing leaves your machine.
 | Which repository | For a push: the push remote of the current branch (pushRemote, pushDefault, the branch's remote, the only remote, origin), or the remote or URL given, read at each URL it pushes to. For gh: the repository `gh repo create` or `gh repo edit` names, or the `repos/<owner>/<repo>` path of `gh api`, else `-R`; a gh write that posts text and names none of those reads `GH_REPO`, then the default `gh repo set-default` chose, then the push remote; a `gh repo edit --visibility public` that names none reads the folder it runs in |
 | Public or not | A ten-minute cache, then `gh api repos/<owner>/<repo>` (sees your private repositories when you are signed in), then GitHub's public REST API with no token; a 404 there means the world cannot see it. A remote it cannot place (an SSH host alias, a self-hosted server) is treated as public; GitLab, Bitbucket and local paths are not GitHub and pass |
 | Not public | Pass, no output, the denylist is never read |
-| Public, or unreadable | Load the denylist (refuse if missing or inside the repository), ask each public URL the push goes to which commits it holds and leave out only what all of them hold, scan the rest: messages, added lines (`git log -p -U0`, merges by `--diff-merges=remerge`; on git older than 2.36, by `-m`, against each parent, which also reads again the lines a merged branch brought), added file names, branch and tag names |
+| Public, or unreadable | Load the denylist (refuse if missing or inside the repository), ask each public URL the push goes to which commits it holds (the git hook: only its own run's URL, when that one is public) and scan what each one does not hold yet: messages, added lines (`git log -p -U0`, merges by `--diff-merges=remerge`; on git older than 2.36, by `-m`, against each parent, which also reads again the lines a merged branch brought), added file names, branch and tag names |
 | Findings | Refuse with up to twelve, each with the file and line or the commit, the category, the pattern id and the matched words |
 
 `PUBLIC_REPO_GUARD_VISIBILITY=public|private` forces the answer (the demo and the tests use it), and
@@ -163,7 +166,7 @@ Be clear-eyed about these before you rely on it:
 | `public-repo-guard scan-tree [DIR]` | every tracked file (or every file of a plain folder) |
 | `public-repo-guard scan-range (RANGE \| --all) [--repo DIR]` | the commits of a range, e.g. `origin/main..HEAD`, or every branch and tag with `--all` |
 | `public-repo-guard check-denylist` | load the denylist; print its count and categories, never its patterns |
-| `public-repo-guard visibility (OWNER/REPO \| URL)` | print public, private, internal, unknown or not-github; only a GitHub repository is looked up |
+| `public-repo-guard visibility (OWNER/REPO \| URL)` | print public, private, internal, unknown or not-github; only a GitHub URL or a plain `OWNER/REPO` is looked up, so a local path of two parts is written `./mirrors/tool.git` |
 
 ## Prior art
 
