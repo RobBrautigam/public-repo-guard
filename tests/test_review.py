@@ -230,6 +230,7 @@ def test_a_merge_s_added_line_is_read_whenever_the_scan_finishes(repo, monkeypat
     ("https://gitlab.com/octo/tool.git", "not-github", []),
     ("git@bitbucket.org:octo/tool.git", "not-github", []),
     ("../remote.git", "not-github", []),
+    ("./mirror.git", "not-github", []),
     ("build-box:octo/tool", "unknown", []),  # an SSH host alias: the hooks treat it as public
     ("https://github.com/octo/tool.git", "public", ["octo/tool"]),
     ("octo/tool", "public", ["octo/tool"]),

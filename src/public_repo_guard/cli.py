@@ -6,6 +6,7 @@
     public-repo-guard scan-tree [DIR]       every tracked file of a folder, before you make it public
     public-repo-guard scan-range RANGE      the commits of a range (origin/main..HEAD), or --all
     public-repo-guard check-denylist        load the denylist and say how many patterns it holds
+    public-repo-guard visibility TARGET     public, private, internal, unknown or not-github
 """
 from __future__ import annotations
 
@@ -20,8 +21,8 @@ from . import __version__
 from . import denylist as dl
 from . import gitscan
 from .command import Unreadable, mentions_publishing, parse
-from .guard import Verdict, check_action, check_push
-from .visibility import github_slug, visibility
+from .guard import Verdict, _answer, check_action, check_push
+from .visibility import repo_arg_slug, visibility
 
 HOOK_MARK = "# installed by public-repo-guard"
 _JSON_KINDS = {str: "a string", list: "an array", dict: "an object", bool: "a boolean", int: "a number",
@@ -230,8 +231,12 @@ def cmd_check_denylist(_args: argparse.Namespace) -> int:
 
 
 def cmd_visibility(args: argparse.Namespace) -> int:
-    slug = github_slug(args.target) or args.target
-    print(visibility(slug))
+    """A GitHub repository is looked up; any other target is answered as the hooks answer its URL
+    (not-github, or unknown for a host this tool cannot place), with no lookup."""
+    slug = repo_arg_slug(args.target)
+    if slug and not slug.split("/", 1)[0].strip("."):
+        slug = None  # ./x or ../x is a relative path: no GitHub owner is named with dots only
+    print(visibility(slug) if slug else _answer(args.target, visibility)[1])
     return 0
 
 
@@ -259,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_scan_range)
     sub.add_parser("check-denylist").set_defaults(fn=cmd_check_denylist)
     p = sub.add_parser("visibility", help="print public, private, internal, unknown or not-github")
-    p.add_argument("target", help="owner/repo or a GitHub URL")
+    p.add_argument("target", help="owner/repo or a remote URL; only a GitHub repository is looked up")
     p.set_defaults(fn=cmd_visibility)
     args = parser.parse_args(argv)
     try:
