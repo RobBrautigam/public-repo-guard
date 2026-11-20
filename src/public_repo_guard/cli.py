@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -23,20 +24,101 @@ from .guard import Verdict, check_action, check_push
 from .visibility import github_slug, visibility
 
 HOOK_MARK = "# installed by public-repo-guard"
+_JSON_KINDS = {str: "a string", list: "an array", dict: "an object", bool: "a boolean", int: "a number",
+               float: "a number"}
+#: an unreadable event's text longer than this is read loosely: refused when it names git or gh at all,
+#: because the publishing pattern backtracks on one long line of git words, and a hook that times out
+#: lets the command run
+_CLOSE_READ_LIMIT = 20_000
+_GIT_OR_GH = re.compile(r"\b(?:git|gh)(?:\.exe)?\b", re.IGNORECASE)
+_JSON_ESCAPE = re.compile(r'\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))')
+_JSON_CHARS = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+
+def _kind(value: object) -> str:
+    return _JSON_KINDS.get(type(value), type(value).__name__)
+
+
+def _read_stdin() -> tuple[str, bool]:
+    """The hook event as the stream's own encoding reads it, and True; bytes that encoding cannot
+    decode come back read as UTF-8 with replacements, and False, so their text is still scanned."""
+    stream = getattr(sys.stdin, "buffer", None)
+    if stream is None:  # a text stream with no bytes beneath it
+        return sys.stdin.read(), True
+    data = stream.read()
+    try:
+        return data.decode(sys.stdin.encoding or "utf-8", sys.stdin.errors or "strict"), True
+    except (UnicodeDecodeError, LookupError):
+        return data.decode("utf-8", "replace"), False
+
+
+def _event_text(raw: str, event: object) -> str:
+    """The event as it came, then its words decoded, so an escape (a tab written as two characters, a
+    letter as a code point) and a list of words (`["gh", "pr", "create"]`) read as a shell would:
+    every string of a parsed event joined by spaces in order, or, for text the json module could not
+    read, the same text with JSON's escapes undone and its punctuation made spaces."""
+    if event is None:
+        undone = _JSON_ESCAPE.sub(lambda m: chr(int(m[1], 16)) if m[1] else _JSON_CHARS.get(m[2], m[2]), raw)
+        return raw + "\n" + re.sub(r'["\[\]{},:]', " ", undone)
+    words: list[str] = []
+    stack = [event]
+    while stack:  # no recursion: the json module reads nesting deeper than a recursive walk could
+        value = stack.pop()
+        if isinstance(value, str):
+            words.append(value)
+        elif isinstance(value, dict):
+            stack.extend(reversed([part for pair in value.items() for part in pair]))
+        elif isinstance(value, list):
+            stack.extend(reversed(value))
+    return raw + "\n" + " ".join(words)
+
+
+def _unreadable_event(raw: str, event: object, why: str) -> int:
+    """An event the hook cannot read is refused when its text looks like it publishes, else passed:
+    an exit of 1 would let the command run unchecked."""
+    text = _event_text(raw, event)
+    if len(text) > _CLOSE_READ_LIMIT:
+        if not _GIT_OR_GH.search(text):
+            return 0
+        looks = "it is too long to read closely and names git or gh"
+    elif mentions_publishing(text):
+        looks = "it looks like it publishes"
+    else:
+        return 0
+    print(f"public-repo-guard: refused. the hook event could not be read ({why}) and {looks}; "
+          f"nothing was checked, so it does not run", file=sys.stderr)
+    return 2
 
 
 def cmd_hook(_args: argparse.Namespace) -> int:
     """Claude Code PreToolUse: exit 2 with the reason on stderr refuses the tool call."""
+    raw, decoded = _read_stdin()
     try:
-        event = json.loads(sys.stdin.read() or "{}")
+        event = json.loads(raw or "{}")
+    except RecursionError:
+        return _unreadable_event(raw, None, "it is nested too deeply to read")
     except ValueError:
+        return _unreadable_event(raw, None, "it could not be parsed as JSON")
+    if not decoded:
+        return _unreadable_event(raw, event, "its bytes could not be decoded")
+    if not isinstance(event, dict):
+        return _unreadable_event(raw, event, "it is not a JSON object")
+    tool_name = event.get("tool_name")
+    if tool_name is not None and not isinstance(tool_name, str):
+        return _unreadable_event(raw, event, f"its tool_name is {_kind(tool_name)}, not a string")
+    if tool_name not in ("Bash", "PowerShell"):
         return 0
-    if not isinstance(event, dict) or event.get("tool_name") not in ("Bash", "PowerShell"):
-        return 0
-    command = (event.get("tool_input") or {}).get("command")
+    tool_input = event.get("tool_input")
+    if tool_input is not None and not isinstance(tool_input, dict):
+        return _unreadable_event(raw, event, f"its tool_input is {_kind(tool_input)}, not an object")
+    command = (tool_input or {}).get("command")
+    if command is not None and not isinstance(command, str):
+        return _unreadable_event(raw, event, f"its command is {_kind(command)}, not a string")
     if not isinstance(command, str) or not command.strip():
         return 0
     cwd = event.get("cwd") or os.getcwd()
+    if not isinstance(cwd, str):
+        return _unreadable_event(raw, event, f"its cwd is {_kind(cwd)}, not a string")
     try:
         actions = parse(command, cwd, powershell=event.get("tool_name") == "PowerShell")
     except Unreadable as exc:
