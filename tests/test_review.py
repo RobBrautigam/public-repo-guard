@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
+import pytest
 from conftest import commit, git, guard
-from test_git import agent
+from test_git import agent, push
 
+from public_repo_guard import cli, gitscan
 from public_repo_guard import denylist as dl
+from public_repo_guard import visibility as vis
 from public_repo_guard.command import Action
 from public_repo_guard.guard import check_action, check_gh_text, check_push
 
@@ -59,13 +63,20 @@ def test_insteadof_rewrites_are_applied_before_reading_visibility(repo, monkeypa
     git(repo, "config", "remote.origin.pushurl", "gh:octo/tool")  # fetches stay on the local stand-in
     commit(repo, "a.txt", "Northwind Traders\n")
     seen: list = []
+    read: list = []
 
     def resolve(slug):
         seen.append(slug)
         return "public" if slug == "octo/tool" else "not-github"
 
+    def holds_nothing(_top, url):  # offline: the URL is never asked over the network
+        read.append(url)
+        return set()
+
+    monkeypatch.setattr(gitscan, "remote_shas", holds_nothing)
     verdict = check_push(repo, "origin", ["main"], dl.load, resolve)
     assert "octo/tool" in seen and verdict.refused
+    assert read == ["https://github.com/octo/tool"]  # the push URL is asked what it holds, not the fetch URL
 
 
 def test_making_a_repository_public_updates_the_visibility_cache(repo, isolated):
@@ -96,3 +107,144 @@ def test_gh_text_follows_the_default_repository_gh_chose(repo, monkeypatch):
 
     verdict = check_gh_text(Path(repo), None, ["Northwind Traders import"], [], dl.load, resolve)
     assert verdict.refused and verdict.target == "octo/public-upstream"
+
+
+def _bare(tmp_path: Path, name: str) -> Path:
+    path = tmp_path / name
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(path))
+    return path
+
+
+def _holds(bare: Path) -> str:
+    return git(bare, "for-each-ref", "--format=%(objectname)")
+
+
+@pytest.mark.parametrize("door", ["agent hook", "git hook"])
+@pytest.mark.parametrize("apart", [True, False], ids=["pushurl apart", "no pushurl"])
+def test_what_the_push_url_holds_is_read_not_the_fetch_url(repo, tmp_path, door, apart):
+    commit(repo, "a.txt", "Northwind Traders\n")
+    git(repo, "push", "-q", "origin", "main")  # the fetch URL holds the name (no hook installed yet)
+    target = tmp_path / "remote.git"
+    if apart:  # the push goes to a repository that holds none of it; every URL reads as public
+        target = _bare(tmp_path, "push.git")
+        git(repo, "config", "remote.origin.pushurl", target.as_posix())
+    commit(repo, "b.txt", "a clean line\n")
+    held = _holds(target)
+    if door == "agent hook":
+        result = agent(repo, "git push origin main")
+    else:
+        assert guard(repo, "install").returncode == 0
+        result = push(repo)
+    if apart:
+        assert result.returncode != 0 and "a.txt (commit" in result.stderr
+        assert _holds(target) == held  # nothing reached the push URL
+    else:
+        assert result.returncode == 0, result.stderr
+
+
+def test_only_what_every_push_url_holds_is_left_out(repo, tmp_path):
+    commit(repo, "a.txt", "Northwind Traders\n")
+    git(repo, "push", "-q", "origin", "main")  # the fetch URL, also the first push URL, holds it
+    for url in (tmp_path / "remote.git", _bare(tmp_path, "behind.git")):
+        git(repo, "config", "--add", "remote.origin.pushurl", url.as_posix())
+    result = agent(repo, "git push origin main")
+    assert result.returncode == 2 and "a.txt (commit" in result.stderr
+
+
+def test_what_the_push_url_already_holds_is_left_out(repo, tmp_path):
+    commit(repo, "a.txt", "Northwind Traders\n")
+    ahead = _bare(tmp_path, "ahead.git")
+    git(repo, "push", "-q", ahead.as_posix(), "main")  # the push URL holds the name; the fetch URL does not
+    git(repo, "config", "remote.origin.pushurl", ahead.as_posix())
+    commit(repo, "b.txt", "a clean line\n")
+    result = agent(repo, "git push origin main")
+    assert result.returncode == 0, result.stderr
+
+
+def _merge_that_adds_a_line(repo: Path) -> None:
+    """A merge whose own resolution adds a line neither parent holds."""
+    git(repo, "checkout", "-q", "-b", "side")
+    commit(repo, "side.txt", "side\n")
+    git(repo, "checkout", "-q", "main")
+    commit(repo, "main.txt", "main\n")
+    git(repo, "merge", "-q", "--no-ff", "--no-commit", "side")
+    (repo / "merged.txt").write_text("Northwind Traders\n", encoding="utf-8")
+    git(repo, "add", "merged.txt")
+    git(repo, "commit", "-q", "-m", "merge side")
+
+
+def _git_log_answers(monkeypatch, answer) -> list[list[str]]:
+    """Record every `git log` the scan runs; `answer(cmd, timeout)` returns a stand-in result,
+    raises, or returns None to let git run."""
+    run = subprocess.run
+    calls: list[list[str]] = []
+
+    def fake(cmd, *args, **kwargs):
+        if cmd[:2] == ["git", "-C"] and "log" in cmd:
+            calls.append(cmd)
+            stand_in = answer(cmd, kwargs.get("timeout"))
+            if stand_in is not None:
+                return stand_in
+        return run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(gitscan.subprocess, "run", fake)
+    return calls
+
+
+def test_a_history_read_that_times_out_is_not_run_again(repo, monkeypatch):
+    _merge_that_adds_a_line(repo)
+
+    def time_out(cmd, timeout):
+        if "--diff-merges=remerge" in cmd:
+            raise subprocess.TimeoutExpired(cmd, timeout)
+
+    calls = _git_log_answers(monkeypatch, time_out)
+    verdict = check_push(repo, "origin", ["main"], dl.load)
+    assert len(calls) == 1
+    assert verdict.refused and "could not finish" in verdict.reason
+
+
+def test_a_history_read_git_refuses_for_another_reason_is_not_run_again(repo, monkeypatch):
+    calls = _git_log_answers(monkeypatch, lambda cmd, timeout: None)
+    with pytest.raises(gitscan.GitError, match="bad revision"):
+        gitscan.scan_commits(repo, ["no-such-branch"], [], dl.load())
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("knows_remerge", [True, False], ids=["git 2.36 or newer", "older git"])
+def test_a_merge_s_added_line_is_read_whenever_the_scan_finishes(repo, monkeypatch, knows_remerge):
+    _merge_that_adds_a_line(repo)
+
+    def older_git(cmd, timeout):
+        if not knows_remerge and "--diff-merges=remerge" in cmd:
+            return subprocess.CompletedProcess(cmd, 128, "", "fatal: unknown value for --diff-merges: remerge\n")
+        return None
+
+    calls = _git_log_answers(monkeypatch, older_git)
+    verdict = check_push(repo, "origin", ["main"], dl.load)
+    assert len(calls) == (1 if knows_remerge else 2)
+    assert verdict.refused and "merged.txt (commit" in verdict.render()
+
+
+@pytest.mark.parametrize("target, printed, looked_up", [
+    ("https://gitlab.com/octo/tool.git", "not-github", []),
+    ("git@bitbucket.org:octo/tool.git", "not-github", []),
+    ("../remote.git", "not-github", []),
+    ("build-box:octo/tool", "unknown", []),  # an SSH host alias: the hooks treat it as public
+    ("https://github.com/octo/tool.git", "public", ["octo/tool"]),
+    ("octo/tool", "public", ["octo/tool"]),
+])
+def test_the_visibility_command_looks_up_only_a_github_repository(monkeypatch, capsys, target, printed,
+                                                                   looked_up):
+    monkeypatch.delenv("PUBLIC_REPO_GUARD_VISIBILITY")
+    lookups: list = []
+
+    def answer(slug):
+        lookups.append(slug)
+        return "public"
+
+    monkeypatch.setattr(vis, "_from_gh", answer)
+    monkeypatch.setattr(vis, "_from_rest", lambda slug: (answer(slug), True))
+    assert cli.main(["visibility", target]) == 0
+    assert capsys.readouterr().out.strip() == printed
+    assert lookups == looked_up
