@@ -69,7 +69,7 @@ def test_insteadof_rewrites_are_applied_before_reading_visibility(repo, monkeypa
         seen.append(slug)
         return "public" if slug == "octo/tool" else "not-github"
 
-    def holds_nothing(_top, url):  # offline: the URL is never asked over the network
+    def holds_nothing(_top, url, _remote=None):  # offline: the URL is never asked over the network
         read.append(url)
         return set()
 
@@ -137,18 +137,85 @@ def test_what_the_push_url_holds_is_read_not_the_fetch_url(repo, tmp_path, door,
         result = push(repo)
     if apart:
         assert result.returncode != 0 and "a.txt (commit" in result.stderr
-        assert _holds(target) == held  # nothing reached the push URL
+        if door == "git hook":  # the agent hook never runs the push, so only this door can move it
+            assert _holds(target) == held  # nothing reached the push URL
     else:
         assert result.returncode == 0, result.stderr
 
 
-def test_only_what_every_push_url_holds_is_left_out(repo, tmp_path):
+@pytest.mark.parametrize("behind_first", [False, True], ids=["behind URL last", "behind URL first"])
+def test_only_what_every_push_url_holds_is_left_out(repo, tmp_path, behind_first):
     commit(repo, "a.txt", "Northwind Traders\n")
-    git(repo, "push", "-q", "origin", "main")  # the fetch URL, also the first push URL, holds it
-    for url in (tmp_path / "remote.git", _bare(tmp_path, "behind.git")):
+    git(repo, "push", "-q", "origin", "main")  # the fetch URL, also a push URL, holds it
+    behind = _bare(tmp_path, "behind.git")
+    urls = [tmp_path / "remote.git", behind]
+    for url in reversed(urls) if behind_first else urls:
         git(repo, "config", "--add", "remote.origin.pushurl", url.as_posix())
     result = agent(repo, "git push origin main")
     assert result.returncode == 2 and "a.txt (commit" in result.stderr
+    assert f"to {behind.as_posix()} (public)" in result.stderr  # the URL that lacks it is named
+
+
+@pytest.mark.parametrize("behind_first", [False, True], ids=["behind URL last", "behind URL first"])
+def test_a_push_url_behind_another_is_scanned_only_for_what_it_lacks(repo, tmp_path, behind_first):
+    commit(repo, "a.txt", "Northwind Traders\n")  # already public: both push URLs hold it
+    behind = _bare(tmp_path, "behind.git")
+    git(repo, "push", "-q", "origin", "main")
+    git(repo, "push", "-q", behind.as_posix(), "main")
+    commit(repo, "b.txt", "a clean line\n")
+    git(repo, "push", "-q", "origin", "main")  # one URL is a commit ahead of the other
+    urls = [tmp_path / "remote.git", behind]
+    for url in reversed(urls) if behind_first else urls:
+        git(repo, "config", "--add", "remote.origin.pushurl", url.as_posix())
+    commit(repo, "c.txt", "another clean line\n")
+    result = agent(repo, "git push origin main")
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_finding_two_push_urls_both_lack_is_listed_once(repo, tmp_path):
+    empty = _bare(tmp_path, "empty.git")  # holds nothing, while the other holds the first commit
+    for url in (tmp_path / "remote.git", empty):
+        git(repo, "config", "--add", "remote.origin.pushurl", url.as_posix())
+    commit(repo, "a.txt", "Northwind Traders\n")
+    verdict = check_push(repo, "origin", ["main"], dl.load)
+    assert verdict.refused
+    assert len([f for f in verdict.findings if f.where.startswith("a.txt (commit")]) == 1
+
+
+def test_the_git_hook_reads_only_the_url_it_runs_for(repo, tmp_path, monkeypatch):
+    commit(repo, "a.txt", "Northwind Traders\n")
+    git(repo, "push", "-q", "origin", "main")
+    ahead, behind = tmp_path / "remote.git", _bare(tmp_path, "behind.git")
+    for url in (ahead, behind):
+        git(repo, "config", "--add", "remote.origin.pushurl", url.as_posix())
+    tip = git(repo, "rev-parse", "HEAD").strip()
+    reads = _git_log_answers(monkeypatch, lambda cmd, timeout: None, word="ls-remote")
+    # git runs the hook once for each push URL and names it; the run for a URL that holds the
+    # commit passes, and only that URL is asked
+    verdict = check_push(repo, "origin", ["main"], dl.load, local_tips=[tip], extra_urls=[ahead.as_posix()])
+    assert not verdict.refused, verdict.render()
+    assert [cmd[-1] for cmd in reads] == [ahead.as_posix()]
+    verdict = check_push(repo, "origin", ["main"], dl.load, local_tips=[tip], extra_urls=[behind.as_posix()])
+    assert verdict.refused and "a.txt (commit" in verdict.render()
+
+
+def test_a_remote_without_a_separate_push_url_is_read_by_its_name(repo, monkeypatch):
+    commit(repo, "a.txt", "a clean line\n")
+    reads = _git_log_answers(monkeypatch, lambda cmd, timeout: None, word="ls-remote")
+    assert not check_push(repo, "origin", ["main"], dl.load).refused
+    # by its name, so the remote's own settings (a proxy, an upload-pack) apply, as for git itself
+    assert [cmd[-1] for cmd in reads] == ["origin"]
+
+
+def test_a_separate_push_url_is_read_with_the_remote_s_proxy(repo, tmp_path, monkeypatch):
+    target = _bare(tmp_path, "push.git")
+    git(repo, "config", "remote.origin.pushurl", target.as_posix())
+    git(repo, "config", "remote.origin.proxy", "http://proxy.example:3128")  # git pushes through it too
+    commit(repo, "a.txt", "a clean line\n")
+    reads = _git_log_answers(monkeypatch, lambda cmd, timeout: None, word="ls-remote")
+    assert not check_push(repo, "origin", ["main"], dl.load).refused
+    assert len(reads) == 1 and reads[0][-1] == target.as_posix()
+    assert "http.proxy=http://proxy.example:3128" in reads[0]
 
 
 def test_what_the_push_url_already_holds_is_left_out(repo, tmp_path):
@@ -173,14 +240,14 @@ def _merge_that_adds_a_line(repo: Path) -> None:
     git(repo, "commit", "-q", "-m", "merge side")
 
 
-def _git_log_answers(monkeypatch, answer) -> list[list[str]]:
-    """Record every `git log` the scan runs; `answer(cmd, timeout)` returns a stand-in result,
-    raises, or returns None to let git run."""
+def _git_log_answers(monkeypatch, answer, word: str = "log") -> list[list[str]]:
+    """Record every `git log` (or other git command, by `word`) the scan runs; `answer(cmd, timeout)`
+    returns a stand-in result, raises, or returns None to let git run."""
     run = subprocess.run
     calls: list[list[str]] = []
 
     def fake(cmd, *args, **kwargs):
-        if cmd[:2] == ["git", "-C"] and "log" in cmd:
+        if cmd[:2] == ["git", "-C"] and word in cmd:
             calls.append(cmd)
             stand_in = answer(cmd, kwargs.get("timeout"))
             if stand_in is not None:
@@ -211,19 +278,49 @@ def test_a_history_read_git_refuses_for_another_reason_is_not_run_again(repo, mo
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("knows_remerge", [True, False], ids=["git 2.36 or newer", "older git"])
-def test_a_merge_s_added_line_is_read_whenever_the_scan_finishes(repo, monkeypatch, knows_remerge):
+def _git_of(version: str):
+    """A stand-in for an older git's answer to `git log`: 2.31 to 2.35 know `--diff-merges` but not
+    `remerge`; before 2.31 git knows no `--diff-merges` at all (the messages are git's own)."""
+    def answer(cmd, timeout):
+        for word in cmd:
+            if version == "2.31 to 2.35" and word == "--diff-merges=remerge":
+                return subprocess.CompletedProcess(cmd, 128, "", "fatal: unknown value for --diff-merges: remerge\n")
+            if version == "before 2.31" and word.startswith("--diff-merges"):
+                return subprocess.CompletedProcess(cmd, 128, "", f"fatal: unrecognized argument: {word}\n")
+        return None
+    return answer
+
+
+@pytest.mark.parametrize("version", ["2.36 or newer", "2.31 to 2.35", "before 2.31"])
+def test_a_merge_s_added_line_is_read_whenever_the_scan_finishes(repo, monkeypatch, version):
+    _merge_that_adds_a_line(repo)
+    calls = _git_log_answers(monkeypatch, _git_of(version))
+    verdict = check_push(repo, "origin", ["main"], dl.load)
+    assert len(calls) == (1 if version == "2.36 or newer" else 2)
+    assert verdict.refused and "merged.txt (commit" in verdict.render()
+
+
+def test_a_merge_s_message_is_listed_once_on_an_older_git(repo, monkeypatch):
+    git(repo, "checkout", "-q", "-b", "side")
+    commit(repo, "side.txt", "side\n")
+    git(repo, "checkout", "-q", "main")
+    commit(repo, "main.txt", "main\n")
+    git(repo, "merge", "-q", "--no-ff", "-m", "merge the Northwind Traders work", "side")
+    _git_log_answers(monkeypatch, _git_of("2.31 to 2.35"))  # -m prints a merge once for each parent
+    verdict = check_push(repo, "origin", ["main"], dl.load)
+    assert verdict.refused
+    assert len([f for f in verdict.findings if "message" in f.where]) == 1
+
+
+def test_a_second_history_read_that_fails_names_git_log(repo, monkeypatch):
     _merge_that_adds_a_line(repo)
 
-    def older_git(cmd, timeout):
-        if not knows_remerge and "--diff-merges=remerge" in cmd:
-            return subprocess.CompletedProcess(cmd, 128, "", "fatal: unknown value for --diff-merges: remerge\n")
-        return None
+    def no_diff_merges_and_no_m(cmd, timeout):
+        return subprocess.CompletedProcess(cmd, 128, "", "fatal: unrecognized argument: --diff-merges=remerge\n")
 
-    calls = _git_log_answers(monkeypatch, older_git)
+    _git_log_answers(monkeypatch, no_diff_merges_and_no_m)
     verdict = check_push(repo, "origin", ["main"], dl.load)
-    assert len(calls) == (1 if knows_remerge else 2)
-    assert verdict.refused and "merged.txt (commit" in verdict.render()
+    assert verdict.refused and "could not finish: git log -m failed" in verdict.reason
 
 
 @pytest.mark.parametrize("target, printed, looked_up", [

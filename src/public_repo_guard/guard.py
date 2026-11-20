@@ -92,17 +92,30 @@ def check_push(top: Path, remote: str | None, refs: list[str], load: Loader,
     public = [(url, target, answer) for url, target, answer in answers if _is_public(answer)]
     if not public:
         return Verdict()
-    _, target, answer = public[0]
+    # git runs the pre-push hook once for each URL it pushes to, naming it: that run reads only its
+    # own URL when it is public; the agent hook, which sees the whole push, reads every public URL
+    reads = [p for p in public if p[0] in (extra_urls or [])] or public
+    _, target, answer = reads[0]
     patterns, refusal = _patterns(load, target, top)
     if refusal:
         return refusal
     try:
-        # each public URL is asked what it holds (the remote's name would read its fetch URL), and
-        # only what all of them hold is left out: anything one lacks is published to it
-        held = set.intersection(*(gitscan.remote_shas(top, url) for url, _, _ in public))
-        exclude = gitscan.present_locally(top, held)
         tips = local_tips if local_tips is not None else _tips(top, refs)
-        findings = gitscan.scan_commits(top, tips, exclude, patterns)
+        # each public URL is asked what it holds (the remote's name would read its fetch URL), and
+        # scanned for what it does not hold: anything one lacks is published to it. A URL holding
+        # the same commits as one already scanned is not scanned again, and a finding is listed once
+        findings: list[dl.Finding] = []
+        scanned: set[tuple[str, ...]] = set()
+        for url, url_target, url_answer in reads:
+            held = tuple(gitscan.present_locally(top, gitscan.remote_shas(top, url, remote)))
+            if held in scanned:
+                continue
+            scanned.add(held)
+            found = gitscan.scan_commits(top, tips, list(held), patterns)
+            new = [f for f in found if f not in findings] if findings else found
+            if new and not findings:
+                target, answer = url_target, url_answer  # name a URL that lacks what is found
+            findings += new
         names = list(refs) if local_tips is not None else _pushed_names(top, refs)
         findings += _scan_ref_names(names, patterns)
     except gitscan.GitError as exc:

@@ -231,8 +231,10 @@ def cmd_check_denylist(_args: argparse.Namespace) -> int:
 
 
 def cmd_visibility(args: argparse.Namespace) -> int:
-    """A GitHub repository is looked up; any other target is answered as the hooks answer its URL
-    (not-github, or unknown for a host this tool cannot place), with no lookup."""
+    """A GitHub URL is looked up, and so is a target of two plain parts, a/b (letters, digits, dots,
+    dashes, underscores), read as owner/repo, so a local path of that shape is written ./a/b; any
+    other target is answered as the hooks answer its URL (not-github, or unknown for a host this
+    tool cannot place), with no lookup."""
     slug = repo_arg_slug(args.target)
     if slug and not slug.split("/", 1)[0].strip("."):
         slug = None  # ./x or ../x is a relative path: no GitHub owner is named with dots only
@@ -264,7 +266,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_scan_range)
     sub.add_parser("check-denylist").set_defaults(fn=cmd_check_denylist)
     p = sub.add_parser("visibility", help="print public, private, internal, unknown or not-github")
-    p.add_argument("target", help="owner/repo or a remote URL; only a GitHub repository is looked up")
+    p.add_argument("target", help="owner/repo or a remote URL; a GitHub URL or a plain a/b is looked up "
+                                  "on GitHub (write a local path of that shape as ./a/b)")
     p.set_defaults(fn=cmd_visibility)
     args = parser.parse_args(argv)
     try:

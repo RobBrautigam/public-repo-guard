@@ -27,6 +27,13 @@ class GitError(Exception):
         self.stderr = stderr
 
 
+def _named(args: tuple[str, ...]) -> str:
+    """The command's first two words for a message, past any leading `-c key=value`."""
+    while len(args) > 2 and args[0] == "-c":
+        args = args[2:]
+    return " ".join(args[:2])
+
+
 def git(cwd: str | Path, *args: str, check: bool = True, timeout: int = 60, input: str | None = None) -> str:
     try:
         result = subprocess.run(
@@ -35,9 +42,9 @@ def git(cwd: str | Path, *args: str, check: bool = True, timeout: int = 60, inpu
             timeout=timeout, creationflags=NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise GitError(f"git {' '.join(args[:2])} could not run: {exc}") from None
+        raise GitError(f"git {_named(args)} could not run: {exc}") from None
     if check and result.returncode != 0:
-        raise GitError(f"git {' '.join(args[:2])} failed: {result.stderr.strip()[:300]}", result.stderr)
+        raise GitError(f"git {_named(args)} failed: {result.stderr.strip()[:300]}", result.stderr)
     return result.stdout
 
 
@@ -114,10 +121,19 @@ def gh_default_remote(top: Path) -> str | None:
     return None
 
 
-def remote_shas(top: Path, remote: str) -> set[str]:
-    """Every commit a remote holds, read from the remote itself (tracking refs go stale). A remote's
-    name reads its fetch URL; to read where a push goes, pass each URL from push_urls."""
-    out = git(top, "ls-remote", remote, timeout=60)
+def remote_shas(top: Path, url: str, remote: str | None = None) -> set[str]:
+    """The tips of every branch and tag a push URL holds, read from the remote itself (tracking refs
+    go stale). A URL that is also `remote`'s fetch URL is read by the remote's name, so its own
+    settings apply (a proxy, an upload-pack); a separate push URL is read as a URL, through the
+    remote's proxy when it names one, as git pushes to it."""
+    where, options = url, []
+    if remote and remote != url:
+        if git(top, "remote", "get-url", remote, check=False).strip() == url:
+            where = remote
+        else:
+            proxy = config(top, f"remote.{remote}.proxy")
+            options = ["-c", f"http.proxy={proxy}"] if proxy else []
+    out = git(top, *options, "ls-remote", where, timeout=60)
     return {line.split("\t", 1)[0] for line in out.splitlines() if "\t" in line}
 
 
@@ -152,6 +168,8 @@ def scan_commits(top: Path, tips: list[str], exclude: list[str], patterns: list[
         # -m: a merge against each parent, which shows every line its resolution added (and lines
         # its parents brought, so a name the remote holds through a merged branch is read again)
         out = git(top, "-c", "log.diffMerges=separate", args[0], "-m", *args[1:], timeout=120, input=excluded)
+        # -m prints a merge's message once for each parent: each finding is listed once
+        return list(dict.fromkeys(parse_log(out, patterns)))
     return parse_log(out, patterns)
 
 
