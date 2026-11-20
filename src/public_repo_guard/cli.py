@@ -23,17 +23,60 @@ from .guard import Verdict, check_action, check_push
 from .visibility import github_slug, visibility
 
 HOOK_MARK = "# installed by public-repo-guard"
+_JSON_KINDS = {str: "a string", list: "an array", dict: "an object", bool: "a boolean", int: "a number",
+               float: "a number"}
+
+
+def _kind(value: object) -> str:
+    return _JSON_KINDS.get(type(value), type(value).__name__)
+
+
+def _event_text(raw: str, event: object) -> str:
+    """The event as it came, then every string in it decoded and joined by spaces in order, so an
+    escape (`\\t`, `\\u0070`) and a list of words (`["gh", "pr", "create"]`) read as a shell would."""
+    words: list[str] = []
+    stack = [event]
+    while stack:  # no recursion: the json module reads nesting deeper than a recursive walk could
+        value = stack.pop()
+        if isinstance(value, str):
+            words.append(value)
+        elif isinstance(value, dict):
+            stack.extend(reversed([part for pair in value.items() for part in pair]))
+        elif isinstance(value, list):
+            stack.extend(reversed(value))
+    return raw + "\n" + " ".join(words)
+
+
+def _unreadable_event(raw: str, event: object, why: str) -> int:
+    """An event the hook cannot read is refused when its text looks like it publishes, else passed:
+    an exit of 1 would let the command run unchecked."""
+    if not mentions_publishing(_event_text(raw, event)):
+        return 0
+    print(f"public-repo-guard: refused. the hook event could not be read ({why}) and it looks like it "
+          f"publishes; nothing was checked, so it does not run", file=sys.stderr)
+    return 2
 
 
 def cmd_hook(_args: argparse.Namespace) -> int:
     """Claude Code PreToolUse: exit 2 with the reason on stderr refuses the tool call."""
+    raw = ""
     try:
-        event = json.loads(sys.stdin.read() or "{}")
+        raw = sys.stdin.read()
+        event = json.loads(raw or "{}")
+    except RecursionError:
+        return _unreadable_event(raw, None, "it is nested too deeply to read")
     except ValueError:
+        return _unreadable_event(raw, None, "it is not JSON")
+    if not isinstance(event, dict):
+        return _unreadable_event(raw, event, "it is not a JSON object")
+    if event.get("tool_name") not in ("Bash", "PowerShell"):
         return 0
-    if not isinstance(event, dict) or event.get("tool_name") not in ("Bash", "PowerShell"):
-        return 0
-    command = (event.get("tool_input") or {}).get("command")
+    tool_input = event.get("tool_input")
+    if tool_input is not None and not isinstance(tool_input, dict):
+        return _unreadable_event(raw, event, f"its tool_input is {_kind(tool_input)}, not an object")
+    command = (tool_input or {}).get("command")
+    if command is not None and not isinstance(command, str):
+        return _unreadable_event(raw, event, f"its command is {_kind(command)}, not a string")
     if not isinstance(command, str) or not command.strip():
         return 0
     cwd = event.get("cwd") or os.getcwd()

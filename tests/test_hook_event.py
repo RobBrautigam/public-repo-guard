@@ -24,6 +24,7 @@ CASES = {
     "string, nothing that publishes": (event("ls -la"), 0),
     "list, git push": (event([PUSH]), 2),
     "list of words, gh pr create": (event(PR.split()), 2),
+    "list of words, escaped git push": (event(PUSH.split()).replace('"push"', '"pu\\u0073h"'), 2),
     "list, nothing that publishes": (event(["ls", "-la"]), 0),
     "number, git push beside it": (event(42, description=PUSH), 2),
     "number, gh pr create beside it": (event(42, description=PR), 2),
