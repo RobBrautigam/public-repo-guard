@@ -88,15 +88,19 @@ def check_push(top: Path, remote: str | None, refs: list[str], load: Loader,
     urls = list(dict.fromkeys([*(u for u in (extra_urls or []) if u), *gitscan.push_urls(top, remote)]))
     if not urls:
         return Verdict()  # git will refuse an unknown remote on its own
-    public = [(target, answer) for target, answer in (_answer(u, resolve) for u in urls) if _is_public(answer)]
+    answers = [(url, *_answer(url, resolve)) for url in urls]
+    public = [(url, target, answer) for url, target, answer in answers if _is_public(answer)]
     if not public:
         return Verdict()
-    target, answer = public[0]
+    _, target, answer = public[0]
     patterns, refusal = _patterns(load, target, top)
     if refusal:
         return refusal
     try:
-        exclude = gitscan.present_locally(top, gitscan.remote_shas(top, remote))
+        # each public URL is asked what it holds (the remote's name would read its fetch URL), and
+        # only what all of them hold is left out: anything one lacks is published to it
+        held = set.intersection(*(gitscan.remote_shas(top, url) for url, _, _ in public))
+        exclude = gitscan.present_locally(top, held)
         tips = local_tips if local_tips is not None else _tips(top, refs)
         findings = gitscan.scan_commits(top, tips, exclude, patterns)
         names = list(refs) if local_tips is not None else _pushed_names(top, refs)

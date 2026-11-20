@@ -19,7 +19,12 @@ _FORMAT = "--format=%x1epublic-repo-guard commit %H%n%B%n%x1epublic-repo-guard e
 
 
 class GitError(Exception):
-    """A git command failed; the caller decides whether that refuses (public) or passes."""
+    """A git command failed; the caller decides whether that refuses (public) or passes. `stderr` is
+    what git itself wrote, empty when git could not run or ran out of time."""
+
+    def __init__(self, message: str, stderr: str = "") -> None:
+        super().__init__(message)
+        self.stderr = stderr
 
 
 def git(cwd: str | Path, *args: str, check: bool = True, timeout: int = 60, input: str | None = None) -> str:
@@ -32,7 +37,7 @@ def git(cwd: str | Path, *args: str, check: bool = True, timeout: int = 60, inpu
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise GitError(f"git {' '.join(args[:2])} could not run: {exc}") from None
     if check and result.returncode != 0:
-        raise GitError(f"git {' '.join(args[:2])} failed: {result.stderr.strip()[:300]}")
+        raise GitError(f"git {' '.join(args[:2])} failed: {result.stderr.strip()[:300]}", result.stderr)
     return result.stdout
 
 
@@ -110,7 +115,8 @@ def gh_default_remote(top: Path) -> str | None:
 
 
 def remote_shas(top: Path, remote: str) -> set[str]:
-    """Every commit the remote holds, read from the remote itself (tracking refs go stale)."""
+    """Every commit a remote holds, read from the remote itself (tracking refs go stale). A remote's
+    name reads its fetch URL; to read where a push goes, pass each URL from push_urls."""
     out = git(top, "ls-remote", remote, timeout=60)
     return {line.split("\t", 1)[0] for line in out.splitlines() if "\t" in line}
 
@@ -139,9 +145,13 @@ def scan_commits(top: Path, tips: list[str], exclude: list[str], patterns: list[
         # remerge: a merge shows only what its resolution added beyond the automatic merge
         out = git(top, args[0], "--diff-merges=remerge", *args[1:], timeout=120, input=excluded)
     except GitError as exc:
-        if "diff-merges" not in str(exc):
+        # run again only when git itself names the option (git older than 2.36); a timeout or any
+        # other failure is not retried, so the scan counts as not finished
+        if "--diff-merges" not in exc.stderr:
             raise
-        out = git(top, *args, timeout=120, input=excluded)  # git older than 2.36
+        # -m: a merge against each parent, which shows every line its resolution added (and lines
+        # its parents brought, so a name the remote holds through a merged branch is read again)
+        out = git(top, "-c", "log.diffMerges=separate", args[0], "-m", *args[1:], timeout=120, input=excluded)
     return parse_log(out, patterns)
 
 
