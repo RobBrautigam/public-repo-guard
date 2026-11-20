@@ -19,7 +19,19 @@ _FORMAT = "--format=%x1epublic-repo-guard commit %H%n%B%n%x1epublic-repo-guard e
 
 
 class GitError(Exception):
-    """A git command failed; the caller decides whether that refuses (public) or passes."""
+    """A git command failed; the caller decides whether that refuses (public) or passes. `stderr` is
+    what git itself wrote, empty when git could not run or ran out of time."""
+
+    def __init__(self, message: str, stderr: str = "") -> None:
+        super().__init__(message)
+        self.stderr = stderr
+
+
+def _named(args: tuple[str, ...]) -> str:
+    """The command's first two words for a message, past any leading `-c key=value`."""
+    while len(args) > 2 and args[0] == "-c":
+        args = args[2:]
+    return " ".join(args[:2])
 
 
 def git(cwd: str | Path, *args: str, check: bool = True, timeout: int = 60, input: str | None = None) -> str:
@@ -30,9 +42,9 @@ def git(cwd: str | Path, *args: str, check: bool = True, timeout: int = 60, inpu
             timeout=timeout, creationflags=NO_WINDOW,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise GitError(f"git {' '.join(args[:2])} could not run: {exc}") from None
+        raise GitError(f"git {_named(args)} could not run: {exc}") from None
     if check and result.returncode != 0:
-        raise GitError(f"git {' '.join(args[:2])} failed: {result.stderr.strip()[:300]}")
+        raise GitError(f"git {_named(args)} failed: {result.stderr.strip()[:300]}", result.stderr)
     return result.stdout
 
 
@@ -109,9 +121,19 @@ def gh_default_remote(top: Path) -> str | None:
     return None
 
 
-def remote_shas(top: Path, remote: str) -> set[str]:
-    """Every commit the remote holds, read from the remote itself (tracking refs go stale)."""
-    out = git(top, "ls-remote", remote, timeout=60)
+def remote_shas(top: Path, url: str, remote: str | None = None) -> set[str]:
+    """The tips of every branch and tag a push URL holds, read from the remote itself (tracking refs
+    go stale). A URL that is also `remote`'s fetch URL is read by the remote's name, so its own
+    settings apply (a proxy, an upload-pack); a separate push URL is read as a URL, through the
+    remote's proxy when it names one, as git pushes to it."""
+    where, options = url, []
+    if remote and remote != url:
+        if git(top, "remote", "get-url", remote, check=False).strip() == url:
+            where = remote
+        else:
+            proxy = config(top, f"remote.{remote}.proxy")
+            options = ["-c", f"http.proxy={proxy}"] if proxy else []
+    out = git(top, *options, "ls-remote", where, timeout=60)
     return {line.split("\t", 1)[0] for line in out.splitlines() if "\t" in line}
 
 
@@ -139,9 +161,15 @@ def scan_commits(top: Path, tips: list[str], exclude: list[str], patterns: list[
         # remerge: a merge shows only what its resolution added beyond the automatic merge
         out = git(top, args[0], "--diff-merges=remerge", *args[1:], timeout=120, input=excluded)
     except GitError as exc:
-        if "diff-merges" not in str(exc):
+        # run again only when git itself names the option (git older than 2.36); a timeout or any
+        # other failure is not retried, so the scan counts as not finished
+        if "--diff-merges" not in exc.stderr:
             raise
-        out = git(top, *args, timeout=120, input=excluded)  # git older than 2.36
+        # -m: a merge against each parent, which shows every line its resolution added (and lines
+        # its parents brought, so a name the remote holds through a merged branch is read again)
+        out = git(top, "-c", "log.diffMerges=separate", args[0], "-m", *args[1:], timeout=120, input=excluded)
+        # -m prints a merge's message once for each parent: each finding is listed once
+        return list(dict.fromkeys(parse_log(out, patterns)))
     return parse_log(out, patterns)
 
 

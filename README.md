@@ -15,16 +15,20 @@ push on their own.
   with the reason. A visibility it cannot read is treated as public and scanned.
 - **Reads what GitHub does not hold yet:** every new commit's message, every added line, every added
   file name (binary and empty files included) and the branch and tag names the push creates. What the
-  remote already holds comes from `git ls-remote`, never stale tracking refs. A line removed in a later
-  commit is still caught, because the history goes public too.
+  remote already holds comes from `git ls-remote` to each public URL the push goes to (the remote's
+  `pushurl` when it has one), never stale tracking refs. A line removed in a later commit is still
+  caught, because the history goes public too.
 - **Two doors, one denylist:** a git `pre-push` hook (any person, any agent, any editor) and a Claude
   Code `PreToolUse` hook that also reads what git never sees: `gh repo create --public`,
   `gh repo edit --visibility public`, and pull request and issue titles, bodies and comments.
 - **The denylist never travels.** It lives outside your repositories (a public push is refused if the
   denylist sits inside the repository being pushed), and a refusal names the pattern id and the
   matched words, never the pattern.
-- **No dependencies**, Python 3.11 or newer, no account. Network: one visibility read per repository
-  every ten minutes, and on a public push, one `git ls-remote` to the remote being pushed to.
+- **No dependencies**, Python 3.11 or newer, no account. Network: a visibility read per repository (an
+  answer GitHub gives, public, private or internal, is kept ten minutes; a 404 from the public API,
+  read as private, and a read that fails are asked again next time), and on a public push, one
+  `git ls-remote` to each public URL the push goes to (the git hook, which git runs once for each
+  URL, asks only its own run's URL when that one is public).
 
 ```
 public-repo-guard: refused. this push would publish private names to ../remote.git (public):
@@ -41,7 +45,7 @@ projects the session touched, and they land on a public main branch. A rule writ
 stop that, because the agent writing the notes is following a different rule. So the check belongs
 at the moment of action: the push itself.
 
-## Quick start (two minutes, offline)
+## Quick start (two minutes; offline after the clone and the install)
 
 ```
 git clone https://github.com/RobBrautigam/public-repo-guard
@@ -80,9 +84,11 @@ and the rewritten fixture goes through. Nothing leaves your machine.
    Patterns are case-insensitive unless `case_sensitive = true`. `PUBLIC_REPO_GUARD_DENYLIST` points
    at another file.
 
-2. **The git hook**, per repository: `public-repo-guard install` (it never overwrites a `pre-push`
-   hook it did not write; it prints the line to add instead). The hook calls the Python that ran
-   `install`, so install from the environment the package lives in.
+2. **The git hook**, per repository: `public-repo-guard install` writes it where git reads that
+   repository's hooks; with `core.hooksPath` set, that is the shared folder, so every repository
+   using it gets the hook. It does not overwrite a `pre-push` hook it did not write unless given
+   `--force`; it prints the line to add instead. The hook calls the Python that ran `install`, so
+   install from the environment the package lives in.
 
 3. **The AI agent hook** (Claude Code), once for every repository, in `~/.claude/settings.json`:
 
@@ -103,7 +109,13 @@ and the rewritten fixture goes through. Nothing leaves your machine.
    `pwsh -Command`, `cmd /c`, `env`, `nice`, `sudo` and `timeout`, skips comments and heredoc bodies,
    and exits 2 with the findings when it refuses; Claude Code shows the agent the reason, and the agent
    fixes the file instead of pushing. Keep the timeout generous: Claude Code lets a command through
-   when its hook times out, and the scan gives git up to three minutes on a large push.
+   when its hook times out. Each git call the scan makes has its own limit, and they add up: 60
+   seconds for each `git ls-remote` and each `git cat-file` (one of each per public URL the push
+   goes to), and 120 for each `git log` (one per public URL holding a different set of commits; two
+   on git older than 2.36); each visibility read before them (one per GitHub repository the push goes
+   to, unless the cache holds it) allows 15 seconds for `gh` and 10 for GitHub's REST API. On Windows
+   a limit is not a hard stop: a git call can run past it while a child process of git still holds
+   its output open.
 
 4. **Before making an old repository public:** `public-repo-guard scan-tree .` reads every tracked
    file, and `public-repo-guard scan-range --all` reads the history of every branch and tag, first
@@ -115,10 +127,10 @@ and the rewritten fixture goes through. Nothing leaves your machine.
 
 | Step | What happens |
 |---|---|
-| Which repository | The push remote of the current branch (pushRemote, pushDefault, the branch's remote, the only remote, origin), or the remote or URL given; `-R` or the `repos/<owner>/<repo>` path for gh |
+| Which repository | For a push: the push remote of the current branch (pushRemote, pushDefault, the branch's remote, the only remote, origin), or the remote or URL given, read at each URL it pushes to. For gh: the repository `gh repo create` or `gh repo edit` names, or the `repos/<owner>/<repo>` path of `gh api`, else `-R`; a gh write that posts text and names none of those reads `GH_REPO`, then the default `gh repo set-default` chose, then the push remote; a `gh repo edit --visibility public` that names none reads the folder it runs in |
 | Public or not | A ten-minute cache, then `gh api repos/<owner>/<repo>` (sees your private repositories when you are signed in), then GitHub's public REST API with no token; a 404 there means the world cannot see it. A remote it cannot place (an SSH host alias, a self-hosted server) is treated as public; GitLab, Bitbucket and local paths are not GitHub and pass |
 | Not public | Pass, no output, the denylist is never read |
-| Public, or unreadable | Load the denylist (refuse if missing or inside the repository), ask the remote which commits it holds, scan the rest: messages, added lines (`git log -p -U0`, merges by `--diff-merges=remerge`), added file names, branch and tag names |
+| Public, or unreadable | Load the denylist (refuse if missing or inside the repository), ask each public URL the push goes to which commits it holds (the git hook: only its own run's URL, when that one is public) and scan what each one does not hold yet: messages, added lines (`git log -p -U0`, merges by `--diff-merges=remerge`; on git older than 2.36, by `-m`, against each parent, which also reads again the lines a merged branch brought), added file names, branch and tag names |
 | Findings | Refuse with up to twelve, each with the file and line or the commit, the category, the pattern id and the matched words |
 
 `PUBLIC_REPO_GUARD_VISIBILITY=public|private` forces the answer (the demo and the tests use it), and
@@ -150,11 +162,11 @@ Be clear-eyed about these before you rely on it:
 |---|---|
 | `public-repo-guard hook` | Claude Code PreToolUse hook; stdin is the hook JSON; exit 2 refuses |
 | `public-repo-guard pre-push REMOTE [URL]` | git pre-push hook; stdin is git's ref lines; exit 1 refuses |
-| `public-repo-guard install [DIR] [--force]` | write the pre-push hook into a repository |
+| `public-repo-guard install [DIR] [--force]` | write the pre-push hook where git reads the repository's hooks (the shared folder when `core.hooksPath` is set) |
 | `public-repo-guard scan-tree [DIR]` | every tracked file (or every file of a plain folder) |
 | `public-repo-guard scan-range (RANGE \| --all) [--repo DIR]` | the commits of a range, e.g. `origin/main..HEAD`, or every branch and tag with `--all` |
 | `public-repo-guard check-denylist` | load the denylist; print its count and categories, never its patterns |
-| `public-repo-guard visibility OWNER/REPO` | print public, private, internal, unknown or not-github |
+| `public-repo-guard visibility (OWNER/REPO \| URL)` | print public, private, internal, unknown or not-github; only a GitHub URL or a plain `OWNER/REPO` is looked up, so a local path of two parts is written `./mirrors/tool.git` |
 
 ## Prior art
 
