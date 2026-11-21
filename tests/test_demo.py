@@ -14,18 +14,26 @@ def _files(folder: Path) -> dict[str, bytes]:
     return {p.relative_to(folder).as_posix(): p.read_bytes() for p in sorted(folder.rglob("*")) if p.is_file()}
 
 
-@pytest.mark.parametrize("where", ["the global config file", "the environment"])
+@pytest.mark.parametrize("where", ["the home folder's .gitconfig", "a GIT_CONFIG_GLOBAL file",
+                                   "GIT_CONFIG_COUNT"])
 def test_the_demo_leaves_a_shared_hooks_folder_as_it_was(isolated, tmp_path, monkeypatch, where):
     shared = tmp_path / "shared-hooks"
     shared.mkdir()
     (shared / "pre-commit").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    if where == "the environment":  # as `git -c core.hooksPath=...` hands it to what git runs
+    setting = f"[core]\n\thooksPath = {shared.as_posix()}\n"
+    if where == "the home folder's .gitconfig":  # where a user's own global config lives
+        monkeypatch.delenv("GIT_CONFIG_GLOBAL")
+        monkeypatch.setenv("HOME", str(isolated))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(isolated / ".config"))
+        with (isolated / ".gitconfig").open("a", encoding="utf-8") as config:
+            config.write(setting)
+    elif where == "a GIT_CONFIG_GLOBAL file":
+        with (isolated / ".gitconfig").open("a", encoding="utf-8") as config:
+            config.write(setting)
+    else:  # as `git -c core.hooksPath=...` hands it to the programs git runs
         monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
         monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
         monkeypatch.setenv("GIT_CONFIG_VALUE_0", shared.as_posix())
-    else:
-        with (isolated / ".gitconfig").open("a", encoding="utf-8") as config:
-            config.write(f"[core]\n\thooksPath = {shared.as_posix()}\n")
     before = _files(shared)
     result = subprocess.run([sys.executable, str(ROOT / "examples" / "demo.py")], cwd=ROOT,
                             capture_output=True, text=True, encoding="utf-8", errors="replace",
