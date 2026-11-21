@@ -3,12 +3,16 @@ lines and added file paths. The contents of binary files are skipped (git prints
 them); their names are read."""
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
 
 from .denylist import Finding, Pattern, scan_lines, scan_name, scan_text
 from .visibility import NO_WINDOW
+
+_WINDOWS = os.name == "nt"
+_STANDARD_RUN = subprocess.run
 
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 _START = "\x1epublic-repo-guard commit "
@@ -34,9 +38,117 @@ def _named(args: tuple[str, ...]) -> str:
     return " ".join(args[:2])
 
 
+if _WINDOWS:
+    import ctypes
+    import errno
+    import threading
+    from ctypes import wintypes
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _k32.CreateJobObjectW.restype = wintypes.HANDLE
+    _k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    _k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    _k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _ntdll = ctypes.WinDLL("ntdll")
+    _ntdll.NtResumeProcess.restype = ctypes.c_long  # an NTSTATUS, 0 on success
+    _ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+    _CREATE_SUSPENDED = 0x00000004
+
+    class _Job:
+        """A Windows job object: git and every process it starts, ended together. Its members are
+        what git started, never a guess from parent process ids, which Windows hands to new
+        processes again. It allows no breakaway: Git for Windows' sh starts its programs outside
+        a job that allows it."""
+
+        def __init__(self) -> None:
+            self.handle = _k32.CreateJobObjectW(None, None)
+
+        def add(self, process: subprocess.Popen) -> bool:
+            # Popen's own handle on the process, which has every access right the call needs
+            return bool(self.handle) and bool(_k32.AssignProcessToJobObject(self.handle, int(process._handle)))
+
+        def end(self) -> None:
+            if self.handle:
+                _k32.TerminateJobObject(self.handle, 1)
+
+        def close(self) -> None:
+            if self.handle:
+                _k32.CloseHandle(self.handle)
+                self.handle = None
+
+    class _Input(threading.Thread):
+        """git's input, written beside the wait for its output: `communicate` writes it before
+        that wait starts, so a git that does not read it would hold the call past its limit.
+        Ending git breaks the pipe, which ends the write. As with `subprocess.run`, a git that
+        ends or stops reading before taking it all is not an error; any other failure is."""
+
+        def __init__(self, pipe, text: str) -> None:
+            super().__init__(daemon=True)
+            self.pipe, self.text, self.error = pipe, text, None
+
+        def run(self) -> None:
+            for step in (lambda: self.pipe.write(self.text), self.pipe.close):
+                try:
+                    step()
+                except OSError as exc:  # EINVAL is how Windows reports a pipe whose reader is gone
+                    if not isinstance(exc, BrokenPipeError) and exc.errno != errno.EINVAL:
+                        self.error = self.error or exc
+
+    def _run(cmd: list[str], *, input: str | None = None, timeout: float | None = None,
+             capture_output: bool = False, **popen) -> subprocess.CompletedProcess:
+        """`subprocess.run` with a limit that ends git and every process it started. At its limit
+        `subprocess.run` ends git alone and then waits for git's output to close, which a process
+        git started (upload-pack, a remote helper, ssh, the shell of an alias) holds open until it
+        finishes; here git and what it started are ended together first. git starts suspended and
+        runs only once it is in the job, so nothing it starts is outside it."""
+        if capture_output:
+            popen["stdout"] = popen["stderr"] = subprocess.PIPE
+        if input is not None:
+            popen["stdin"] = subprocess.PIPE
+        popen["creationflags"] = popen.get("creationflags", 0) | _CREATE_SUSPENDED
+        job = _Job()
+        try:
+            process = subprocess.Popen(cmd, **popen)
+            try:
+                held = job.add(process)
+            finally:  # resumed on every path: a git left suspended would wait out its whole limit
+                resumed = _ntdll.NtResumeProcess(int(process._handle)) == 0
+            if not resumed:
+                process.kill()
+                process.communicate()  # it never ran, so it started nothing that holds its output
+                raise OSError("git was started but could not be resumed")
+            writer = None
+            if input is not None:
+                writer, process.stdin = _Input(process.stdin, input), None
+                writer.start()
+            try:
+                out, err = process.communicate(timeout=timeout)
+            except BaseException:  # the limit, or an interrupt
+                if held:
+                    job.end()
+                process.kill()
+                try:  # the output closes once they are gone; with no job, wait five seconds at most
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.poll()
+                raise
+            if writer is not None:
+                writer.join(5)  # git has ended; a process it left holding the pipe gets five seconds
+                if writer.error:
+                    raise writer.error
+        finally:
+            job.close()
+        return subprocess.CompletedProcess(process.args, process.returncode, out, err)
+
+
 def git(cwd: str | Path, *args: str, check: bool = True, timeout: int = 60, input: str | None = None) -> str:
+    # on Windows git runs through _run, whose limit ends what git started too; a subprocess.run
+    # put in place of the standard one (a test's stand-in for git) is called as it stands, and so
+    # is the standard one on Linux and macOS, where the call already returns at its limit
+    run = _run if _WINDOWS and subprocess.run is _STANDARD_RUN else subprocess.run
     try:
-        result = subprocess.run(
+        result = run(
             ["git", "-C", str(cwd), "-c", "core.quotePath=false", *args],
             input=input, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=timeout, creationflags=NO_WINDOW,
