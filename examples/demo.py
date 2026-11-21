@@ -3,7 +3,9 @@ repository the guard is told to treat as public), the example denylist, and thre
 
     python examples/demo.py
 
-Nothing leaves your machine: the remote is a folder in a temporary directory.
+Nothing leaves your machine: the remote is a folder in a temporary directory. git runs with an
+empty config of its own, so a hooks folder (`core.hooksPath`) or anything else set in yours is
+neither used nor written to.
 """
 from __future__ import annotations
 
@@ -30,8 +32,10 @@ def step(title: str) -> None:
 def main() -> int:
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         root = Path(tmp)
+        (root / "gitconfig").write_text("", encoding="utf-8")
         env = dict(os.environ)
         env.update({
+            "GIT_CONFIG_GLOBAL": str(root / "gitconfig"), "GIT_CONFIG_NOSYSTEM": "1",
             "PUBLIC_REPO_GUARD_DENYLIST": str(HERE / "denylist.toml"),
             "PUBLIC_REPO_GUARD_VISIBILITY": "public",   # stand-in for a public GitHub repository
             "PUBLIC_REPO_GUARD_CACHE": str(root / "cache.json"),
