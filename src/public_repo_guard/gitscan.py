@@ -3,12 +3,16 @@ lines and added file paths. The contents of binary files are skipped (git prints
 them); their names are read."""
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
 
 from .denylist import Finding, Pattern, scan_lines, scan_name, scan_text
 from .visibility import NO_WINDOW
+
+_WINDOWS = os.name == "nt"
+_STANDARD_RUN = subprocess.run
 
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 _START = "\x1epublic-repo-guard commit "
@@ -34,9 +38,85 @@ def _named(args: tuple[str, ...]) -> str:
     return " ".join(args[:2])
 
 
+if _WINDOWS:
+    import ctypes
+    from ctypes import wintypes
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _k32.CreateJobObjectW.restype = wintypes.HANDLE
+    _k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    _k32.OpenProcess.restype = wintypes.HANDLE
+    _k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    _k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    class _Job:
+        """A Windows job object: git, once added, and every process it starts after that, ended
+        together. Its members are what git started, never a guess from parent process ids, which
+        Windows hands to new processes again. It allows no breakaway: Git for Windows' own
+        programs (its sh, its ssh) start theirs outside any job that allows it."""
+
+        def __init__(self) -> None:
+            self.handle = _k32.CreateJobObjectW(None, None)
+
+        def add(self, pid: int) -> bool:
+            if not self.handle:
+                return False
+            process = _k32.OpenProcess(0x0100 | 0x0001, False, pid)  # PROCESS_SET_QUOTA, _TERMINATE
+            if not process:
+                return False
+            try:
+                return bool(_k32.AssignProcessToJobObject(self.handle, process))
+            finally:
+                _k32.CloseHandle(process)
+
+        def end(self) -> None:
+            if self.handle:
+                _k32.TerminateJobObject(self.handle, 1)
+
+        def close(self) -> None:
+            if self.handle:
+                _k32.CloseHandle(self.handle)
+                self.handle = None
+
+    def _run(cmd: list[str], *, input: str | None = None, timeout: float | None = None,
+             capture_output: bool = False, **popen) -> subprocess.CompletedProcess:
+        """`subprocess.run` with a limit that is a hard stop. At its limit `subprocess.run` ends git
+        alone and then waits for git's output to close, which a process git started (upload-pack,
+        a remote helper, ssh, the shell of an alias) holds open until it finishes; here git and
+        what it started are ended together first."""
+        if capture_output:
+            popen["stdout"] = popen["stderr"] = subprocess.PIPE
+        if input is not None:
+            popen["stdin"] = subprocess.PIPE
+        job = _Job()
+        try:
+            process = subprocess.Popen(cmd, **popen)
+            held = job.add(process.pid)  # at once: git has not started anything yet
+            try:
+                out, err = process.communicate(input, timeout=timeout)
+            except BaseException:  # the limit, or an interrupt
+                if held:
+                    job.end()
+                process.kill()
+                try:
+                    process.communicate(timeout=5)  # the output closes once they are gone
+                except subprocess.TimeoutExpired:
+                    process.poll()  # a process outside the job still holds it: stop waiting
+                raise
+        finally:
+            job.close()
+        return subprocess.CompletedProcess(process.args, process.returncode, out, err)
+
+
 def git(cwd: str | Path, *args: str, check: bool = True, timeout: int = 60, input: str | None = None) -> str:
+    # on Windows git runs through _run, whose limit ends what git started too; a subprocess.run
+    # put in place of the standard one (a test's stand-in for git) is called as it stands, and so
+    # is the standard one on Linux and macOS, where the call already returns at its limit
+    run = _run if _WINDOWS and subprocess.run is _STANDARD_RUN else subprocess.run
     try:
-        result = subprocess.run(
+        result = run(
             ["git", "-C", str(cwd), "-c", "core.quotePath=false", *args],
             input=input, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=timeout, creationflags=NO_WINDOW,
