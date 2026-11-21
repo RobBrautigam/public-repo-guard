@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from conftest import NO_WINDOW, ROOT
 
 
@@ -13,12 +14,18 @@ def _files(folder: Path) -> dict[str, bytes]:
     return {p.relative_to(folder).as_posix(): p.read_bytes() for p in sorted(folder.rglob("*")) if p.is_file()}
 
 
-def test_the_demo_leaves_a_shared_hooks_folder_as_it_was(isolated, tmp_path):
+@pytest.mark.parametrize("where", ["the global config file", "the environment"])
+def test_the_demo_leaves_a_shared_hooks_folder_as_it_was(isolated, tmp_path, monkeypatch, where):
     shared = tmp_path / "shared-hooks"
     shared.mkdir()
     (shared / "pre-commit").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    with (isolated / ".gitconfig").open("a", encoding="utf-8") as config:  # the global config
-        config.write(f"[core]\n\thooksPath = {shared.as_posix()}\n")
+    if where == "the environment":  # as `git -c core.hooksPath=...` hands it to what git runs
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", shared.as_posix())
+    else:
+        with (isolated / ".gitconfig").open("a", encoding="utf-8") as config:
+            config.write(f"[core]\n\thooksPath = {shared.as_posix()}\n")
     before = _files(shared)
     result = subprocess.run([sys.executable, str(ROOT / "examples" / "demo.py")], cwd=ROOT,
                             capture_output=True, text=True, encoding="utf-8", errors="replace",

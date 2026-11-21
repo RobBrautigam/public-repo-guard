@@ -11,12 +11,15 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from public_repo_guard import gitscan
 
 WINDOWS = os.name == "nt"
 LIMIT = 6    # seconds: room for git, its shell and two Pythons to start on a busy machine
 MARGIN = 4   # the call returns at most this long after its limit
 SLEEP = 25   # how long the alias's two processes would run if nothing ended them
+STILL_ACTIVE = 0x102  # WaitForSingleObject's WAIT_TIMEOUT: the process is still running
 
 CHILD = """\
 import os, subprocess, sys, time
@@ -42,42 +45,43 @@ time.sleep({sleep})
 
 class Watched:
     """The alias's processes, read by process id while the call runs. On Windows each is held
-    open by a handle, so its id cannot pass to another process before it is checked or stopped."""
+    open by a handle, so its id cannot pass to another process before it is checked or stopped.
+    Elsewhere an id is signalled only while its process is sure to be running (it sleeps SLEEP
+    seconds from its start, and nothing else ends it there), so it is never another process's."""
 
     def __init__(self) -> None:
         self.ids: dict[str, int] = {}
+        self.seen: dict[str, float] = {}
         self.handles: dict[str, int] = {}
 
     def look(self, folder: Path) -> None:
         for name in ("child", "grandchild"):
             path = folder / f"{name}.pid"
             if name not in self.ids and path.exists():
-                self.ids[name] = int(path.read_text())
+                self.ids[name], self.seen[name] = int(path.read_text()), time.monotonic()
                 if WINDOWS:
                     handle = _kernel32().OpenProcess(0x00100000 | 0x0001 | 0x1000, False, self.ids[name])
                     if handle:  # SYNCHRONIZE, PROCESS_TERMINATE, PROCESS_QUERY_LIMITED_INFORMATION
                         self.handles[name] = handle
 
     def running(self, name: str, wait: float = 0.0) -> bool:
-        if WINDOWS:
-            handle = self.handles.get(name)
-            return bool(handle) and _kernel32().WaitForSingleObject(handle, int(wait * 1000)) == 0x102
-        try:
-            os.kill(self.ids[name], 0)
-        except ProcessLookupError:
-            return False
-        return True
+        """Windows only: whether the process is still running after `wait` seconds."""
+        handle = self.handles.get(name)
+        return bool(handle) and _kernel32().WaitForSingleObject(handle, int(wait * 1000)) == STILL_ACTIVE
 
     def stop(self) -> None:
-        """Every process this test started, stopped by its own id (or handle)."""
+        """Every process this test started, stopped by its own handle (Windows) or id."""
         for name, pid in self.ids.items():
             if WINDOWS:
                 handle = self.handles.get(name)
                 if handle:
                     _kernel32().TerminateProcess(handle, 1)
                     _kernel32().CloseHandle(handle)
-            elif self.running(name):
-                os.kill(pid, signal.SIGKILL)
+            elif time.monotonic() - self.seen[name] < SLEEP - 5:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
 
 
 def _kernel32():
@@ -94,7 +98,8 @@ def _kernel32():
     return k32
 
 
-def test_a_git_call_past_its_limit_is_stopped_with_what_git_started(tmp_path):
+def _past_the_limit(tmp_path: Path, input: str | None = None) -> None:
+    """Run the sleeping alias through gitscan.git with LIMIT, and check the call and its processes."""
     folder = tmp_path / "sleepy"
     folder.mkdir()
     (folder / "child.py").write_text(CHILD.format(sleep=SLEEP), encoding="utf-8")
@@ -106,7 +111,7 @@ def test_a_git_call_past_its_limit_is_stopped_with_what_git_started(tmp_path):
     def call() -> None:
         start = time.monotonic()
         try:
-            gitscan.git(tmp_path, "-c", alias, "sleepy", timeout=LIMIT)
+            gitscan.git(tmp_path, "-c", alias, "sleepy", timeout=LIMIT, input=input)
         except gitscan.GitError as exc:
             outcome["error"] = str(exc)
         outcome["seconds"] = time.monotonic() - start
@@ -130,3 +135,25 @@ def test_a_git_call_past_its_limit_is_stopped_with_what_git_started(tmp_path):
             assert not watched.running("grandchild", wait=2), "the child's own child is still running"
     finally:
         watched.stop()
+
+
+def test_a_git_call_past_its_limit_is_stopped_with_what_git_started(tmp_path):
+    _past_the_limit(tmp_path)
+
+
+def test_the_limit_holds_while_git_leaves_its_input_unread(tmp_path):
+    # far more than a pipe holds: writing it waits on a reader that never reads
+    _past_the_limit(tmp_path, input="x" * (4 << 20))
+
+
+@pytest.mark.skipif(not WINDOWS, reason="the job object is Windows only")
+def test_git_is_in_the_job_before_it_runs(tmp_path, monkeypatch):
+    # a slow join gives a git already running the time to start its alias outside the job
+    join = gitscan._Job.add
+
+    def slow_join(self, *args):
+        time.sleep(1.5)
+        return join(self, *args)
+
+    monkeypatch.setattr(gitscan._Job, "add", slow_join)
+    _past_the_limit(tmp_path)
