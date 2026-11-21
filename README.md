@@ -60,7 +60,8 @@ pytest
 `examples/demo.py` makes a throwaway repository and a throwaway "GitHub" (a local bare repository
 the guard is told to treat as public), installs the hook, and pushes three times: a clean commit goes
 through, a fixture copied from a "real client" is refused at `git push` and again at the agent hook,
-and the rewritten fixture goes through. Nothing leaves your machine.
+and the rewritten fixture goes through. Nothing leaves your machine, and its git runs with an empty
+config of its own, so a hooks folder (`core.hooksPath`) set in yours is neither used nor written to.
 
 ## Use it on your own repositories
 
@@ -113,9 +114,11 @@ and the rewritten fixture goes through. Nothing leaves your machine.
    seconds for each `git ls-remote` and each `git cat-file` (one of each per public URL the push
    goes to), and 120 for each `git log` (one per public URL holding a different set of commits; two
    on git older than 2.36); each visibility read before them (one per GitHub repository the push goes
-   to, unless the cache holds it) allows 15 seconds for `gh` and 10 for GitHub's REST API. On Windows
-   a limit is not a hard stop: a git call can run past it while a child process of git still holds
-   its output open.
+   to, unless the cache holds it) allows 15 seconds for `gh` and 10 for GitHub's REST API. At its
+   limit a git call ends git and returns. On Windows it first ends every process git started (git
+   runs in a job object), since one of them can hold git's output open, and waits at most five
+   seconds more for that output; on Linux and macOS the processes git started are left to end on
+   their own.
 
 4. **Before making an old repository public:** `public-repo-guard scan-tree .` reads every tracked
    file, and `public-repo-guard scan-range --all` reads the history of every branch and tag, first

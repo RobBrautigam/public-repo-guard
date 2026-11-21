@@ -54,8 +54,8 @@ if _WINDOWS:
     class _Job:
         """A Windows job object: git, once added, and every process it starts after that, ended
         together. Its members are what git started, never a guess from parent process ids, which
-        Windows hands to new processes again. It allows no breakaway: Git for Windows' own
-        programs (its sh, its ssh) start theirs outside any job that allows it."""
+        Windows hands to new processes again. It allows no breakaway: Git for Windows' sh starts
+        its programs outside a job that allows it."""
 
         def __init__(self) -> None:
             self.handle = _k32.CreateJobObjectW(None, None)
@@ -93,7 +93,8 @@ if _WINDOWS:
         job = _Job()
         try:
             process = subprocess.Popen(cmd, **popen)
-            held = job.add(process.pid)  # at once: git has not started anything yet
+            # at once; a process git starts before this line is outside the job, as with no job
+            held = job.add(process.pid)
             try:
                 out, err = process.communicate(input, timeout=timeout)
             except BaseException:  # the limit, or an interrupt
